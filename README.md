@@ -32,7 +32,10 @@ Catalog cache ships in `data/` (`catalog.json`, `catalog-meta.json`, `details-ca
 
 ## Railway
 
-1. Deploy from this repo. Start command: `python main.py` (or use the `Procfile` worker).
-2. Set env vars from `.env.example` (`TOKEN`, `COOKIE`, guild/channel ids, etc.).
-3. **Persist cache across deploys:** create a volume mounted at `/data`, then set `DATA_DIR=/data`.
-4. On first boot with an empty volume, the bot copies the bundled `data/` cache into `DATA_DIR`, then keeps writing updates there with atomic saves.
+1. Deploy from this repo. Do **not** set a custom build command — Railpack installs deps from `requirements.txt` automatically.
+2. Start command: `python main.py` (set in `railway.json` / `Procfile`).
+3. Set env vars from `.env.example` (`TOKEN`, `COOKIE`, guild/channel ids, etc.).
+4. **Persist cache across deploys:** create a volume mounted at `/data`, then set `DATA_DIR=/data`.
+5. On first boot with an empty volume, the bot copies the bundled `data/` cache into `DATA_DIR`, then keeps writing updates there with atomic saves.
+
+If deploy fails with `python main.py` during **build**, remove any custom `buildCommand` in the Railway service settings and redeploy.
