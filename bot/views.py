@@ -6,6 +6,7 @@ import discord
 
 from bot.auth import can_use_wallet, deny_runner, deny_wallet, is_runner
 from bot.embeds import build_inspect_pages, build_purchase_embed
+from economy.guard import is_purchase_blocked
 from economy.service import CURRENCY_ROBUX, CURRENCY_TICKETS
 
 if TYPE_CHECKING:
@@ -78,11 +79,12 @@ class BuyButton(discord.ui.Button):
         self.owner_id = owner_id
         self.currency = currency
         offsale = item.get("isForSale") is False
+        blocked = is_purchase_blocked(item)
 
         if currency == CURRENCY_TICKETS:
             tix = _tix_price(item)
             label = "Buy with tix" if tix is None else f"Buy with tix · {tix:,}"
-            enabled = _can_buy_tix(item)
+            enabled = _can_buy_tix(item) and not blocked
         else:
             price = _robux_price(item)
             if price is None:
@@ -91,9 +93,12 @@ class BuyButton(discord.ui.Button):
                 label = "Buy · Free"
             else:
                 label = f"Buy · {price:,} R$"
-            enabled = _can_buy_robux(item)
+            enabled = _can_buy_robux(item) and not blocked
 
-        if offsale:
+        if blocked:
+            label = "Blocked"
+            enabled = False
+        elif offsale:
             label = "Offsale"
             enabled = False
 
@@ -109,6 +114,12 @@ class BuyButton(discord.ui.Button):
             return
         if not can_use_wallet(interaction, self.bot.settings):
             await deny_wallet(interaction)
+            return
+        if is_purchase_blocked(self.item):
+            await interaction.response.send_message(
+                "This item is blocked from purchase.",
+                ephemeral=True,
+            )
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
@@ -138,7 +149,7 @@ class InspectView(discord.ui.View):
         self.item = item
         self.pages = pages
         self.owner_id = owner_id
-        if allow_buy:
+        if allow_buy and not is_purchase_blocked(item):
             if _can_buy_robux(item) or item.get("isForSale") is False:
                 self.add_item(
                     BuyButton(

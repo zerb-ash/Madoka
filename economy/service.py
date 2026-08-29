@@ -4,6 +4,7 @@ import asyncio
 from typing import Any
 
 from madxka.http import MadxkaHttp
+from economy.guard import is_purchase_blocked, purchase_block_reason
 
 
 CURRENCY_ROBUX = 1
@@ -70,6 +71,16 @@ class EconomyService:
         asset_id = int(item.get("id") or 0)
         if not asset_id:
             raise ValueError("missing asset id")
+        block = purchase_block_reason(item)
+        if block:
+            name = str(item.get("name") or asset_id)
+            print(f"[purchase] blocked `{asset_id}` {name} · matched /{block}/")
+            return {
+                "request": None,
+                "result": {},
+                "purchased": False,
+                "reason": "blocked dangerous item name",
+            }
         body = purchase_payload(item, currency=currency)
         result = await self.http.purchase_product(asset_id, body)
         return {
@@ -104,6 +115,12 @@ class EconomyService:
 
             if owned:
                 _log(f"{label} · skip (already owned)")
+                skipped.append(item)
+                await asyncio.sleep(0.05)
+                continue
+
+            if is_purchase_blocked(item):
+                _log(f"{label} · skip (blocked dangerous name)")
                 skipped.append(item)
                 await asyncio.sleep(0.05)
                 continue
