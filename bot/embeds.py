@@ -12,6 +12,12 @@ if TYPE_CHECKING:
     from bot.client import MadokaBot
 
 
+def _item_url(item: dict[str, Any]) -> str:
+    item_id = int(item.get("id") or 0)
+    name = str(item.get("name") or item_id)
+    return catalog_item(item_id, name)
+
+
 def _price_text(item: dict[str, Any]) -> str:
     if item.get("isForSale") is False:
         return "Offsale"
@@ -166,7 +172,7 @@ def build_purchase_embed(item: dict[str, Any], outcome: dict[str, Any]) -> disco
     )
     item_id = int(item.get("id") or 0)
     name = str(item.get("name") or item_id)
-    embed.description = f"[{name}]({catalog_item(item_id)}) · `{item_id}`"
+    embed.description = f"[{name}]({_item_url(item)}) · `{item_id}`"
     embed.add_field(name="Reason", value=str(outcome.get("reason") or result.get("reason") or "?"), inline=False)
     currency = int(request.get("expectedCurrency") or result.get("currency") or 1)
     unit = "tix" if currency == 2 else "R$"
@@ -220,7 +226,7 @@ def build_diff_embed(
         for item in added[:8]:
             item_id = int(item.get("id") or 0)
             name = str(item.get("name") or item_id)
-            lines.append(f"[{name}]({catalog_item(item_id)}) · `{item_id}`")
+            lines.append(f"[{name}]({_item_url(item)}) · `{item_id}`")
         if len(added) > 8:
             lines.append(f"-# +{len(added) - 8} more")
         embed.add_field(name="New items", value="\n".join(lines), inline=False)
@@ -267,7 +273,7 @@ def build_buy_free_embed(outcome: dict[str, Any]) -> discord.Embed:
         for item in bought[:12]:
             item_id = int(item.get("id") or 0)
             name = str(item.get("name") or item_id)
-            lines.append(f"[{name}]({catalog_item(item_id)}) · `{item_id}`")
+            lines.append(f"[{name}]({_item_url(item)}) · `{item_id}`")
         if len(bought) > 12:
             lines.append(f"-# +{len(bought) - 12} more")
         embed.add_field(name="Purchased items", value="\n".join(lines)[:1024], inline=False)
@@ -310,7 +316,7 @@ def build_poll_embed(
             item_id = int(item.get("id") or 0)
             name = str(item.get("name") or item_id)
             price = _price_text(item)
-            lines.append(f"[{name}]({catalog_item(item_id)}) · `{item_id}` · {price}")
+            lines.append(f"[{name}]({_item_url(item)}) · `{item_id}` · {price}")
         if len(added) > 10:
             lines.append(f"-# +{len(added) - 10} more")
         embed.add_field(name="New items", value="\n".join(lines)[:1024], inline=False)
@@ -350,7 +356,7 @@ def build_inspect_pages(
 
     embed = discord.Embed(
         title=name,
-        url=catalog_item(item_id),
+        url=catalog_item(item_id, name),
         description=_inspect_body_md(merged, item_id),
         color=0xEB459E,
         timestamp=datetime.now(timezone.utc),
