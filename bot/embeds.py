@@ -234,6 +234,57 @@ def build_diff_embed(
     return embed
 
 
+def build_minute_report_embed(
+    *,
+    polls: int,
+    added: list[dict[str, Any]],
+    changed: list[dict[str, Any]],
+    removed: list[dict[str, Any]],
+    stats: dict[str, Any] | None = None,
+) -> discord.Embed:
+    embed = discord.Embed(
+        title="Poll Minute Report",
+        description=f"Polled **{polls:,}** time(s) this minute.",
+        color=0x5865F2 if added or changed or removed else 0x57F287,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Added", value=str(len(added)), inline=True)
+    embed.add_field(name="Changed", value=str(len(changed)), inline=True)
+    embed.add_field(name="Removed", value=str(len(removed)), inline=True)
+
+    def _lines(items: list[dict[str, Any]], limit: int = 20) -> str:
+        if not items:
+            return "—"
+        rows: list[str] = []
+        for item in items[:limit]:
+            item_id = int(item.get("id") or 0)
+            name = str(item.get("name") or item_id)
+            price = _price_text(item)
+            rows.append(f"[{name}]({_item_url(item)}) · `{item_id}` · {price}")
+        if len(items) > limit:
+            rows.append(f"-# +{len(items) - limit} more")
+        return "\n".join(rows)[:1024]
+
+    if added:
+        embed.add_field(name="Added items", value=_lines(added), inline=False)
+    if changed:
+        embed.add_field(name="Changed items", value=_lines(changed), inline=False)
+    if removed:
+        embed.add_field(name="Removed items", value=_lines(removed, limit=20), inline=False)
+
+    if stats:
+        bits: list[str] = []
+        if stats.get("count") is not None:
+            bits.append(f"{int(stats['count']):,} items tracked")
+        digest = stats.get("hash")
+        if digest:
+            bits.append(f"hash `{str(digest)[:16]}`")
+        if bits:
+            embed.set_footer(text=" · ".join(bits))
+
+    return embed
+
+
 def build_poll_ok_embed(*, stats: dict[str, Any] | None = None) -> discord.Embed:
     embed = discord.Embed(
         title="Catalog poll",

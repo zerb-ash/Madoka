@@ -41,7 +41,8 @@ class Settings:
     cookie: str
     discord_guild_id: int | None
     watch_channel_id: int | None
-    poll_interval_minutes: int
+    poll_interval_seconds: int
+    poll_report_seconds: int
     debug: bool
     wallet_owner_id: int
     data_dir: Path
@@ -54,13 +55,24 @@ def load_settings() -> Settings:
     guild = os.getenv("DISCORD_GUILD_ID", "").strip()
     watch = os.getenv("WATCH_CHANNEL_ID", "").strip()
     owner = os.getenv("WALLET_OWNER_ID", "1521237044746125462").strip()
+    poll_sec = os.getenv("POLL_INTERVAL_SECONDS", "").strip()
+    poll_min = os.getenv("POLL_INTERVAL_MINUTES", "").strip()
+    if poll_sec.isdigit():
+        poll_interval_seconds = max(1, int(poll_sec))
+    elif poll_min.isdigit():
+        poll_interval_seconds = max(1, int(poll_min) * 60)
+    else:
+        poll_interval_seconds = 1
+    report_sec = os.getenv("POLL_REPORT_SECONDS", "60").strip()
+    poll_report_seconds = max(poll_interval_seconds, int(report_sec)) if report_sec.isdigit() else 60
     data = ensure_data_dir(_resolve_data_dir())
     return Settings(
         discord_token=(os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN") or "").strip(),
         cookie=(os.getenv("COOKIE") or "").strip(),
         discord_guild_id=int(guild) if guild.isdigit() else None,
         watch_channel_id=int(watch) if watch.isdigit() else None,
-        poll_interval_minutes=max(1, int(os.getenv("POLL_INTERVAL_MINUTES", "1"))),
+        poll_interval_seconds=poll_interval_seconds,
+        poll_report_seconds=poll_report_seconds,
         debug=os.getenv("DEBUG", "").strip().lower() in {"1", "true", "yes", "on"},
         wallet_owner_id=int(owner) if owner.isdigit() else 1521237044746125462,
         data_dir=data,
