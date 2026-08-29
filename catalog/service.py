@@ -84,18 +84,18 @@ class CatalogService:
         self._lock = asyncio.Lock()
 
     async def ensure_loaded(self) -> None:
-        async with self._lock:
-            if self.cache.stubs:
-                return
-            await self.refresh(force=False)
+        if self.cache.stubs:
+            return
+        await self.refresh(force=False)
 
     async def warm_start(self) -> None:
         await self.refresh(force=True)
 
     async def refresh(self, *, force: bool = False) -> CatalogDiff | None:
+        new_stubs = await self.http.search_items()
+        new_hash = catalog_hash(new_stubs)
+
         async with self._lock:
-            new_stubs = await self.http.search_items()
-            new_hash = catalog_hash(new_stubs)
             old_stubs = list(self.cache.stubs)
             old_hash = self.cache.meta.get("hash")
 
@@ -147,12 +147,13 @@ class CatalogService:
         if missing:
             fetched = await self.fetch_details(missing)
             by_id = {int(row.get("id") or 0): row for row in fetched}
-            for stub in missing:
-                row = by_id.get(int(stub.get("id") or 0))
-                if row:
-                    self.cache.put_details(_stub_key(stub), stub, row)
-                    ready.append(row)
-            self.cache.save()
+            async with self._lock:
+                for stub in missing:
+                    row = by_id.get(int(stub.get("id") or 0))
+                    if row:
+                        self.cache.put_details(_stub_key(stub), stub, row)
+                        ready.append(row)
+                self.cache.save()
 
         return ready
 
@@ -204,8 +205,9 @@ class CatalogService:
         if not rows:
             return cached
         row = rows[0]
-        self.cache.put_details(key, stub, row)
-        self.cache.save()
+        async with self._lock:
+            self.cache.put_details(key, stub, row)
+            self.cache.save()
         return row
 
     async def search_name(self, query: str, *, limit: int = 25) -> list[dict[str, Any]]:

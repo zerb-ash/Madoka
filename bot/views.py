@@ -6,6 +6,7 @@ import discord
 
 from bot.auth import can_use_wallet, deny_runner, deny_wallet, is_runner
 from bot.embeds import build_inspect_pages, build_purchase_embed
+from economy.service import CURRENCY_ROBUX, CURRENCY_TICKETS
 
 if TYPE_CHECKING:
     from bot.client import MadokaBot
@@ -16,6 +17,32 @@ async def _check_runner(interaction: discord.Interaction, owner_id: int) -> bool
         return True
     await deny_runner(interaction)
     return False
+
+
+def _robux_price(item: dict[str, Any]) -> int | None:
+    if item.get("price") is not None:
+        return int(item["price"])
+    if item.get("lowestPrice") is not None:
+        return int(item["lowestPrice"])
+    return None
+
+
+def _tix_price(item: dict[str, Any]) -> int | None:
+    if item.get("priceTickets") is None:
+        return None
+    return int(item["priceTickets"])
+
+
+def _can_buy_robux(item: dict[str, Any]) -> bool:
+    if item.get("isForSale") is False:
+        return False
+    return _robux_price(item) is not None
+
+
+def _can_buy_tix(item: dict[str, Any]) -> bool:
+    if item.get("isForSale") is False:
+        return False
+    return _tix_price(item) is not None
 
 
 async def _inspect_payload(
@@ -44,22 +71,38 @@ class BuyButton(discord.ui.Button):
         bot: MadokaBot,
         item: dict[str, Any],
         owner_id: int,
+        currency: int,
     ) -> None:
-        price = item.get("price")
-        if price is None:
-            price = item.get("lowestPrice")
-        label = "Buy" if price is None else f"Buy · {int(price):,} R$"
-        if item.get("isForSale") is False:
-            label = "Offsale"
-        super().__init__(
-            label=label[:80],
-            style=discord.ButtonStyle.success,
-            disabled=item.get("isForSale") is False,
-            row=2,
-        )
         self.bot = bot
         self.item = item
         self.owner_id = owner_id
+        self.currency = currency
+        offsale = item.get("isForSale") is False
+
+        if currency == CURRENCY_TICKETS:
+            tix = _tix_price(item)
+            label = "Buy with tix" if tix is None else f"Buy with tix · {tix:,}"
+            enabled = _can_buy_tix(item)
+        else:
+            price = _robux_price(item)
+            if price is None:
+                label = "Buy"
+            elif price == 0:
+                label = "Buy · Free"
+            else:
+                label = f"Buy · {price:,} R$"
+            enabled = _can_buy_robux(item)
+
+        if offsale:
+            label = "Offsale"
+            enabled = False
+
+        super().__init__(
+            label=label[:80],
+            style=discord.ButtonStyle.success if currency == CURRENCY_ROBUX else discord.ButtonStyle.primary,
+            disabled=not enabled,
+            row=0,
+        )
 
     async def callback(self, interaction: discord.Interaction) -> None:
         if not await _check_runner(interaction, self.owner_id):
@@ -69,7 +112,7 @@ class BuyButton(discord.ui.Button):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            outcome = await self.bot.economy.purchase(self.item)
+            outcome = await self.bot.economy.purchase(self.item, currency=self.currency)
         except Exception as e:
             await interaction.followup.send(f"Purchase failed: `{e}`", ephemeral=True)
             return
@@ -95,48 +138,25 @@ class InspectView(discord.ui.View):
         self.item = item
         self.pages = pages
         self.owner_id = owner_id
-        self.page = 0
         if allow_buy:
-            self.add_item(BuyButton(bot=bot, item=item, owner_id=owner_id))
-        self._sync()
-
-    def _embed(self) -> discord.Embed:
-        return self.pages[self.page]
-
-    def _sync(self) -> None:
-        total = len(self.pages)
-        self.prev_btn.disabled = self.page <= 0 or total <= 1
-        self.next_btn.disabled = self.page >= total - 1 or total <= 1
-        self.page_btn.label = f"{self.page + 1}/{total}"
-        self.page_btn.disabled = True
-
-    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
-    async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await _check_runner(interaction, self.owner_id):
-            return
-        if self.page <= 0:
-            await interaction.response.defer()
-            return
-        self.page -= 1
-        self._sync()
-        await interaction.response.edit_message(embed=self._embed(), view=self)
-
-    @discord.ui.button(label="1/1", style=discord.ButtonStyle.primary, row=1)
-    async def page_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await _check_runner(interaction, self.owner_id):
-            return
-        await interaction.response.defer()
-
-    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
-    async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await _check_runner(interaction, self.owner_id):
-            return
-        if self.page >= len(self.pages) - 1:
-            await interaction.response.defer()
-            return
-        self.page += 1
-        self._sync()
-        await interaction.response.edit_message(embed=self._embed(), view=self)
+            if _can_buy_robux(item) or item.get("isForSale") is False:
+                self.add_item(
+                    BuyButton(
+                        bot=bot,
+                        item=item,
+                        owner_id=owner_id,
+                        currency=CURRENCY_ROBUX,
+                    )
+                )
+            if _can_buy_tix(item):
+                self.add_item(
+                    BuyButton(
+                        bot=bot,
+                        item=item,
+                        owner_id=owner_id,
+                        currency=CURRENCY_TICKETS,
+                    )
+                )
 
 
 class InspectPickView(discord.ui.View):
@@ -160,10 +180,18 @@ class InspectPickView(discord.ui.View):
         for item in results[:25]:
             item_id = int(item.get("id") or 0)
             name = str(item.get("name") or item_id)
-            price = item.get("price")
-            if price is None:
-                price = item.get("lowestPrice")
-            desc = f"{int(price or 0):,} R$" if item.get("isForSale") is not False else "Offsale"
+            robux = _robux_price(item)
+            tix = _tix_price(item)
+            if item.get("isForSale") is False:
+                desc = "Offsale"
+            elif robux is not None and tix is not None:
+                desc = f"{robux:,} R$ / {tix:,} tix"
+            elif tix is not None:
+                desc = f"{tix:,} tix"
+            elif robux is not None:
+                desc = f"{robux:,} R$" if robux else "Free"
+            else:
+                desc = "—"
             options.append(
                 discord.SelectOption(
                     label=name[:100],

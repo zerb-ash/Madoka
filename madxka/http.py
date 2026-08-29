@@ -211,6 +211,17 @@ class MadxkaHttp:
             raise MadxkaApiError(500, f"{API}/economy/v1/users/{user_id}/currency", "bad payload")
         return payload
 
+    async def user_owns_asset(self, user_id: int, asset_id: int) -> bool:
+        payload = await self._request(
+            API,
+            "GET",
+            f"/inventory/v1/users/{int(user_id)}/items/Asset/{int(asset_id)}",
+        )
+        if not isinstance(payload, dict):
+            return False
+        data = payload.get("data")
+        return isinstance(data, list) and len(data) > 0
+
     async def purchase_product(self, asset_id: int, purchase_body: dict[str, Any]) -> dict[str, Any]:
         payload = await self._request(
             API,

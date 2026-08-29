@@ -16,12 +16,18 @@ def _price_text(item: dict[str, Any]) -> str:
     if item.get("isForSale") is False:
         return "Offsale"
     price = item.get("price")
-    if price is None:
-        lowest = item.get("lowestPrice")
-        if lowest is not None:
-            return f"{int(lowest):,} R$ (resale)"
-        return "Free"
-    return f"{int(price):,} R$"
+    tix = item.get("priceTickets")
+    if price is not None:
+        robux = f"Free" if int(price) == 0 else f"{int(price):,} R$"
+        if tix is not None:
+            return f"{robux} / {int(tix):,} tix"
+        return robux
+    lowest = item.get("lowestPrice")
+    if lowest is not None:
+        return f"{int(lowest):,} R$ (resale)"
+    if tix is not None:
+        return f"{int(tix):,} tix"
+    return "—"
 
 
 def _limited_text(item: dict[str, Any]) -> str:
@@ -119,6 +125,11 @@ def _inspect_body_md(item: dict[str, Any], item_id: int) -> str:
     parts.append(_md_line("ID", f"`{item_id}`"))
     parts.append(_md_line("Limited", _md_val(item.get("isLimited"))))
     parts.append(_md_line("Limited U", _md_val(item.get("isLimitedUnique"))))
+    price = item.get("price")
+    if price is None:
+        parts.append(_md_line("Price", "—"))
+    else:
+        parts.append(_md_line("Price", "Free" if int(price) == 0 else f"{int(price):,} R$"))
     parts.append(_md_line("Ticket price", _md_val(item.get("priceTickets"))))
     serials = item.get("serialCount")
     parts.append(_md_line("Serials", f"{int(serials):,}" if serials is not None else "—"))
@@ -146,6 +157,7 @@ def build_balance_embed(payload: dict[str, Any]) -> discord.Embed:
 
 def build_purchase_embed(item: dict[str, Any], outcome: dict[str, Any]) -> discord.Embed:
     result = outcome.get("result") or {}
+    request = outcome.get("request") or {}
     ok = bool(outcome.get("purchased"))
     embed = discord.Embed(
         title="Purchase " + ("success" if ok else "failed"),
@@ -156,8 +168,13 @@ def build_purchase_embed(item: dict[str, Any], outcome: dict[str, Any]) -> disco
     name = str(item.get("name") or item_id)
     embed.description = f"[{name}]({catalog_item(item_id)}) · `{item_id}`"
     embed.add_field(name="Reason", value=str(outcome.get("reason") or result.get("reason") or "?"), inline=False)
-    if result.get("price") is not None:
-        embed.add_field(name="Paid", value=f"{int(result['price']):,} R$", inline=True)
+    currency = int(request.get("expectedCurrency") or result.get("currency") or 1)
+    unit = "tix" if currency == 2 else "R$"
+    paid = result.get("price")
+    if paid is None:
+        paid = request.get("expectedPrice")
+    if paid is not None:
+        embed.add_field(name="Paid", value=f"{int(paid):,} {unit}", inline=True)
     if result.get("sellerName"):
         embed.add_field(name="Seller", value=str(result["sellerName"]), inline=True)
     return embed

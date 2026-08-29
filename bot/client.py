@@ -14,7 +14,7 @@ from bot.embeds import (
     build_poll_embed,
     build_poll_ok_embed,
 )
-from bot.views import InspectPickView, send_inspect
+from bot.views import InspectPickView, InspectView, send_inspect
 from catalog.service import CatalogDiff, CatalogService
 from config.settings import Settings
 from economy.service import EconomyService
@@ -43,6 +43,7 @@ class MadokaBot(commands.Bot):
         self.api = MadxkaHttp(settings.cookie)
         self.catalog = CatalogService(self.api, self.cache)
         self.economy = EconomyService(self.api)
+        self._watch_channel_cache: discord.abc.Messageable | None = None
 
     def _register_commands(self) -> None:
         self.tree.add_command(inspect_cmd)
@@ -116,6 +117,9 @@ class MadokaBot(commands.Bot):
         await super().close()
 
     async def _watch_channel(self) -> discord.abc.Messageable | None:
+        if self._watch_channel_cache is not None:
+            return self._watch_channel_cache
+
         channel_id = self.settings.watch_channel_id
         if not channel_id:
             return None
@@ -123,17 +127,34 @@ class MadokaBot(commands.Bot):
         if channel is None:
             try:
                 channel = await self.fetch_channel(channel_id)
-            except Exception:
+            except Exception as e:
+                print(f"[madoka] watch channel fetch failed: {e}")
                 return None
         if not isinstance(channel, discord.abc.Messageable):
+            print(f"[madoka] watch channel {channel_id} is not messageable")
             return None
+        self._watch_channel_cache = channel
         return channel
 
-    async def _announce_ok(self) -> None:
+    async def _watch_send(
+        self,
+        *,
+        content: str | None = None,
+        embed: discord.Embed | None = None,
+        view: discord.ui.View | None = None,
+    ) -> None:
         channel = await self._watch_channel()
         if channel is None:
+            print("[madoka] watch send skipped: no channel")
             return
-        await channel.send(embed=build_poll_ok_embed(stats=self.catalog.stats()))
+        try:
+            await channel.send(content=content, embed=embed, view=view)
+        except Exception as e:
+            print(f"[madoka] watch send failed: {e}")
+            self._watch_channel_cache = None
+
+    async def _announce_ok(self) -> None:
+        await self._watch_send(embed=build_poll_ok_embed(stats=self.catalog.stats()))
 
     async def _announce_diff(self, diff: CatalogDiff) -> None:
         total = len(diff.added) + len(diff.changed) + len(diff.removed)
@@ -147,6 +168,7 @@ class MadokaBot(commands.Bot):
 
         channel = await self._watch_channel()
         if channel is None:
+            print("[madoka] poll announce skipped: no channel")
             return
 
         added_ids = {int(s.get("id") or 0) for s in diff.added}
@@ -160,24 +182,32 @@ class MadokaBot(commands.Bot):
             removed_count=len(diff.removed),
             stats=self.catalog.stats(),
         )
-        await channel.send(embed=poll_embed)
+        owner_id = self.settings.wallet_owner_id
+        await self._watch_send(content=f"<@{owner_id}>", embed=poll_embed)
 
         if not added_rows:
             return
 
-        item_ids = [int(item.get("id") or 0) for item in added_rows[:5]]
-        thumbs = await self.api.asset_thumbnails(item_ids)
         for item in added_rows[:5]:
+            try:
+                balance = await self.economy.balance()
+            except Exception:
+                balance = None
             item_id = int(item.get("id") or 0)
-            thumb = thumbs.get(item_id)
             stub = self.cache.find_stub(item_id)
-            pages = build_inspect_pages(item, stub=stub, thumbnail=thumb)
-            embed = pages[0]
-            embed.title = f"New item · {embed.title}"
-            await channel.send(embed=embed)
+            thumb = await self.api.asset_thumbnail(item_id)
+            pages = build_inspect_pages(item, stub=stub, thumbnail=thumb, balance=balance)
+            view = InspectView(
+                self,
+                item=item,
+                pages=pages,
+                owner_id=owner_id,
+                allow_buy=True,
+            )
+            await self._watch_send(embed=pages[0], view=view)
 
         if len(added_rows) > 5:
-            await channel.send(embed=discord.Embed(
+            await self._watch_send(embed=discord.Embed(
                 description=f"-# +{len(added_rows) - 5} more new items",
                 color=0xFEE75C,
             ))
@@ -186,24 +216,27 @@ class MadokaBot(commands.Bot):
     async def watch_loop(self) -> None:
         try:
             diff = await self.catalog.refresh(force=False)
+
+            if diff is None:
+                if self.settings.debug:
+                    print("[madoka] poll: no changes")
+                await self._announce_ok()
+                return
+
+            total = len(diff.added) + len(diff.changed) + len(diff.removed)
+            if total <= 0:
+                if self.settings.debug:
+                    print("[madoka] poll: hash changed but no diff rows")
+                await self._announce_ok()
+                return
+
+            await self._announce_diff(diff)
         except Exception as e:
-            print(f"[madoka] poll failed: {e}")
-            return
+            print(f"[madoka] poll cycle failed: {e}")
 
-        if diff is None:
-            if self.settings.debug:
-                print("[madoka] poll: no changes")
-            await self._announce_ok()
-            return
-
-        total = len(diff.added) + len(diff.changed) + len(diff.removed)
-        if total <= 0:
-            if self.settings.debug:
-                print("[madoka] poll: hash changed but no diff rows")
-            await self._announce_ok()
-            return
-
-        await self._announce_diff(diff)
+    @watch_loop.error
+    async def watch_loop_error(self, error: BaseException) -> None:
+        print(f"[madoka] watch loop crashed: {error}")
 
     @watch_loop.before_loop
     async def before_watch_loop(self) -> None:
@@ -284,23 +317,31 @@ async def buy_free_cmd(interaction: discord.Interaction) -> None:
         return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
+    print("[buy free] command started")
     try:
+        print("[buy free] refreshing catalog...")
         await bot.catalog.refresh(force=True)
+        print("[buy free] scanning free on-sale items...")
         free_items = await bot.catalog.free_items()
+        print(f"[buy free] found {len(free_items)} free on-sale item(s)")
     except Exception as e:
+        print(f"[buy free] catalog scan failed: {e}")
         await interaction.followup.send(f"Catalog scan failed: `{e}`", ephemeral=True)
         return
 
     if not free_items:
+        print("[buy free] nothing to buy")
         await interaction.followup.send("No free on-sale items found in the catalog.", ephemeral=True)
         return
 
     try:
         outcome = await bot.economy.purchase_all_free(free_items)
     except Exception as e:
+        print(f"[buy free] failed: {e}")
         await interaction.followup.send(f"Buy free failed: `{e}`", ephemeral=True)
         return
 
+    print("[buy free] command finished")
     await interaction.followup.send(embed=build_buy_free_embed(outcome), ephemeral=True)
 
 

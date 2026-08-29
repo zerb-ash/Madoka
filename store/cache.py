@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -8,6 +10,27 @@ from typing import Any
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 class CatalogCache:
@@ -58,17 +81,17 @@ class CatalogCache:
 
     def save(self) -> None:
         self.catalog_path.parent.mkdir(parents=True, exist_ok=True)
-        self.catalog_path.write_text(
+        _atomic_write(
+            self.catalog_path,
             json.dumps(self.stubs, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
-        self.meta_path.write_text(
+        _atomic_write(
+            self.meta_path,
             json.dumps(self.meta, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
-        self.details_path.write_text(
+        _atomic_write(
+            self.details_path,
             json.dumps(self.details, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
 
     def touch(self) -> None:
@@ -81,6 +104,7 @@ class CatalogCache:
             "hash": digest,
             "fetched_at": _utc_now(),
             "count": len(stubs),
+            "checked_at": self.meta.get("checked_at"),
         }
 
     def find_stub(self, item_id: int) -> dict[str, Any] | None:

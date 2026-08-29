@@ -7,25 +7,37 @@ from madxka.http import MadxkaHttp
 
 
 CURRENCY_ROBUX = 1
+CURRENCY_TICKETS = 2
 
 
-def purchase_payload(item: dict[str, Any]) -> dict[str, Any]:
+def purchase_payload(item: dict[str, Any], *, currency: int = CURRENCY_ROBUX) -> dict[str, Any]:
     asset_id = int(item.get("id") or 0)
     seller = item.get("creatorTargetId")
     if seller is None and isinstance(item.get("lowestSellerData"), dict):
         seller = item["lowestSellerData"].get("sellerId")
-    price = item.get("price")
-    if price is None:
-        price = item.get("lowestPrice")
-    if price is None:
-        price = 0
+
+    if currency == CURRENCY_TICKETS:
+        price = item.get("priceTickets")
+        if price is None:
+            price = 0
+    else:
+        price = item.get("price")
+        if price is None:
+            price = item.get("lowestPrice")
+        if price is None:
+            price = 0
+
     return {
         "assetId": asset_id,
         "expectedPrice": int(price),
         "expectedSellerId": int(seller or 1),
         "userAssetId": None,
-        "expectedCurrency": CURRENCY_ROBUX,
+        "expectedCurrency": int(currency),
     }
+
+
+def _log(msg: str) -> None:
+    print(f"[buy free] {msg}")
 
 
 class EconomyService:
@@ -49,11 +61,16 @@ class EconomyService:
             "tickets": int(currency.get("tickets") or 0),
         }
 
-    async def purchase(self, item: dict[str, Any]) -> dict[str, Any]:
+    async def purchase(
+        self,
+        item: dict[str, Any],
+        *,
+        currency: int = CURRENCY_ROBUX,
+    ) -> dict[str, Any]:
         asset_id = int(item.get("id") or 0)
         if not asset_id:
             raise ValueError("missing asset id")
-        body = purchase_payload(item)
+        body = purchase_payload(item, currency=currency)
         result = await self.http.purchase_product(asset_id, body)
         return {
             "request": body,
@@ -67,33 +84,64 @@ class EconomyService:
         skipped: list[dict[str, Any]] = []
         failed: list[tuple[dict[str, Any], str]] = []
 
-        for item in items:
+        user = await self.session_user()
+        uid = int(user.get("id") or 0)
+        total = len(items)
+        _log(f"start · user {user.get('name')} ({uid}) · {total} free item(s)")
+
+        for i, item in enumerate(items, start=1):
             asset_id = int(item.get("id") or 0)
             name = str(item.get("name") or asset_id)
+            label = f"[{i}/{total}] `{asset_id}` {name}"
+
+            try:
+                owned = await self.http.user_owns_asset(uid, asset_id)
+            except Exception as e:
+                _log(f"{label} · own-check failed: {e}")
+                failed.append((item, f"own-check failed: {e}"))
+                await asyncio.sleep(0.08)
+                continue
+
+            if owned:
+                _log(f"{label} · skip (already owned)")
+                skipped.append(item)
+                await asyncio.sleep(0.05)
+                continue
+
+            _log(f"{label} · buying...")
             try:
                 outcome = await self.purchase(item)
             except Exception as e:
                 err = str(e)
                 if "already owned" in err.lower():
+                    _log(f"{label} · skip (already owned)")
                     skipped.append(item)
                 else:
+                    _log(f"{label} · failed: {err}")
                     failed.append((item, err))
                 await asyncio.sleep(0.12)
                 continue
 
             if outcome.get("purchased"):
+                _log(f"{label} · bought")
                 bought.append(item)
             else:
                 reason = str(outcome.get("reason") or "")
                 if "already owned" in reason.lower():
+                    _log(f"{label} · skip (already owned)")
                     skipped.append(item)
                 else:
+                    _log(f"{label} · declined: {reason or 'purchase declined'}")
                     failed.append((item, reason or "purchase declined"))
 
             await asyncio.sleep(0.12)
 
+        _log(
+            f"done · scanned {total} · bought {len(bought)} · "
+            f"skipped {len(skipped)} · failed {len(failed)}"
+        )
         return {
-            "scanned": len(items),
+            "scanned": total,
             "bought": bought,
             "skipped": skipped,
             "failed": failed,

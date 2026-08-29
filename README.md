@@ -8,6 +8,8 @@ Discord bot for [madxka.com](https://madxka.com) catalog monitoring, item inspec
 2. Install dependencies: `pip install -r requirements.txt`
 3. Run: `python main.py`
 
+Catalog cache ships in `data/` (`catalog.json`, `catalog-meta.json`, `details-cache.json`).
+
 ## Commands
 
 - `/inspect` — look up an item by id or name
@@ -26,3 +28,11 @@ Discord bot for [madxka.com](https://madxka.com) catalog monitoring, item inspec
 | `WATCH_CHANNEL_ID` | Channel for catalog poll embeds |
 | `WALLET_OWNER_ID` | Discord user id allowed to use wallet commands |
 | `POLL_INTERVAL_MINUTES` | Catalog poll interval (default 1) |
+| `DATA_DIR` | Cache directory (default `./data`). On Railway use a volume path like `/data` |
+
+## Railway
+
+1. Deploy from this repo. Start command: `python main.py` (or use the `Procfile` worker).
+2. Set env vars from `.env.example` (`TOKEN`, `COOKIE`, guild/channel ids, etc.).
+3. **Persist cache across deploys:** create a volume mounted at `/data`, then set `DATA_DIR=/data`.
+4. On first boot with an empty volume, the bot copies the bundled `data/` cache into `DATA_DIR`, then keeps writing updates there with atomic saves.

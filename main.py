@@ -20,6 +20,7 @@ def main() -> None:
     if settings.debug:
         if settings.watch_channel_id:
             print(f"watch channel {settings.watch_channel_id}")
+        print(f"data dir {settings.data_dir}")
     bot = MadokaBot(settings)
     bot.run(settings.discord_token)
 
