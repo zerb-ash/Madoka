@@ -234,6 +234,11 @@ class InspectPickView(discord.ui.View):
             return
         allow_buy = self.allow_buy and can_use_wallet(interaction, self.bot.settings)
         await interaction.response.defer(thinking=True)
+        item_id = int(item.get("id") or 0)
+        if item_id:
+            fresh = await self.bot.catalog.lookup_id(item_id, force=True)
+            if fresh:
+                item = fresh
         pages, _stub, _thumb = await _inspect_payload(
             self.bot,
             item,
@@ -254,6 +259,11 @@ async def send_inspect(
     bot: MadokaBot,
     item: dict[str, Any],
 ) -> None:
+    item_id = int(item.get("id") or 0)
+    if item_id:
+        fresh = await bot.catalog.lookup_id(item_id, force=True)
+        if fresh:
+            item = fresh
     allow_buy = can_use_wallet(interaction, bot.settings)
     pages, _stub, _thumb = await _inspect_payload(bot, item, show_wallet=allow_buy)
     view = InspectView(

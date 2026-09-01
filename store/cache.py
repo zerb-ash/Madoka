@@ -33,6 +33,10 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+def _item_key(stub: dict[str, Any]) -> str:
+    return f"{str(stub.get('itemType') or 'Asset')}:{int(stub.get('id') or 0)}"
+
+
 class CatalogCache:
     def __init__(
         self,
@@ -135,3 +139,47 @@ class CatalogCache:
 
     def drop_details(self, key: str) -> None:
         self.details.pop(key, None)
+
+    def failed_detail_ids(self) -> set[int]:
+        raw = self.meta.get("details_failed")
+        if not isinstance(raw, list):
+            return set()
+        out: set[int] = set()
+        for val in raw:
+            try:
+                out.add(int(val))
+            except (TypeError, ValueError):
+                continue
+        return out
+
+    def mark_details_failed(self, item_id: int) -> None:
+        failed = self.failed_detail_ids()
+        failed.add(int(item_id))
+        self.meta["details_failed"] = sorted(failed)
+
+    def is_details_failed(self, item_id: int) -> bool:
+        return int(item_id) in self.failed_detail_ids()
+
+    def missing_stubs(self) -> list[dict[str, Any]]:
+        missing: list[dict[str, Any]] = []
+        for stub in self.stubs:
+            item_id = stub.get("id")
+            if item_id is None:
+                continue
+            if self.is_details_failed(int(item_id)):
+                continue
+            key = _item_key(stub)
+            cached = self.get_details(key)
+            if cached and self.stub_matches(key, stub):
+                continue
+            missing.append(stub)
+        return missing
+
+    def iter_cached_items(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for stub in self.stubs:
+            key = _item_key(stub)
+            cached = self.get_details(key)
+            if cached and self.stub_matches(key, stub) and not cached.get("_detailsUnavailable"):
+                rows.append(cached)
+        return rows

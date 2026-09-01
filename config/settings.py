@@ -49,6 +49,7 @@ class Settings:
     catalog_path: Path
     catalog_meta_path: Path
     details_path: Path
+    ignore_path: Path
 
 
 def load_settings() -> Settings:
@@ -79,4 +80,5 @@ def load_settings() -> Settings:
         catalog_path=data / "catalog.json",
         catalog_meta_path=data / "catalog-meta.json",
         details_path=data / "details-cache.json",
+        ignore_path=data / "ignore-keywords.json",
     )

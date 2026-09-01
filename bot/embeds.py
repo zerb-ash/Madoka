@@ -6,6 +6,7 @@ from typing import Any, TYPE_CHECKING
 
 import discord
 
+from catalog.restrictions import is_limited, is_limited_unique, normalize_item
 from madxka.urls import catalog_item, group_page, user_profile
 
 if TYPE_CHECKING:
@@ -37,12 +38,12 @@ def _price_text(item: dict[str, Any]) -> str:
 
 
 def _limited_text(item: dict[str, Any]) -> str:
-    if item.get("isLimitedUnique"):
+    if is_limited_unique(item):
         serial = item.get("serialCount")
         if serial:
             return f"Limited U ({int(serial):,})"
         return "Limited U"
-    if item.get("isLimited"):
+    if is_limited(item):
         return "Limited"
     return "Regular"
 
@@ -123,14 +124,16 @@ def _md_val(val: Any) -> str:
 
 def _inspect_body_md(item: dict[str, Any], item_id: int) -> str:
     parts: list[str] = []
+    if item.get("_detailsUnavailable"):
+        parts.extend(["-# Full details unavailable from catalog API (bad item data on site).", ""])
     desc = str(item.get("description") or "").strip()
     if desc:
         parts.extend(["## Description", _quote_block(desc), ""])
 
     parts.append("## Item")
     parts.append(_md_line("ID", f"`{item_id}`"))
-    parts.append(_md_line("Limited", _md_val(item.get("isLimited"))))
-    parts.append(_md_line("Limited U", _md_val(item.get("isLimitedUnique"))))
+    parts.append(_md_line("Limited", _md_val(is_limited(item))))
+    parts.append(_md_line("Limited U", _md_val(is_limited_unique(item))))
     price = item.get("price")
     if price is None:
         parts.append(_md_line("Price", "—"))
@@ -194,6 +197,10 @@ def build_catalog_stats_embed(stats: dict[str, Any]) -> discord.Embed:
     )
     embed.add_field(name="Items", value=str(int(stats.get("count") or 0)), inline=True)
     embed.add_field(name="Details cached", value=str(int(stats.get("details_cached") or 0)), inline=True)
+    if stats.get("details_missing") is not None:
+        embed.add_field(name="Details missing", value=str(int(stats.get("details_missing") or 0)), inline=True)
+    if stats.get("details_failed"):
+        embed.add_field(name="Details failed", value=str(int(stats.get("details_failed") or 0)), inline=True)
 
     digest = stats.get("hash")
     if digest:
@@ -386,12 +393,7 @@ def build_poll_embed(
 
 
 def _merged_item(item: dict[str, Any], stub: dict[str, Any] | None) -> dict[str, Any]:
-    out = dict(item)
-    if stub:
-        for key in ("isLimited", "isLimitedUnique"):
-            if key in stub and key not in out:
-                out[key] = stub[key]
-    return out
+    return normalize_item(item, stub)
 
 
 def build_inspect_pages(

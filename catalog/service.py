@@ -8,11 +8,25 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from madxka.http import MadxkaHttp
+from catalog.restrictions import normalize_item
+from madxka.http import MadxkaApiError, MadxkaHttp
 from store.cache import CatalogCache
 
 
 DETAILS_BATCH = 100
+
+
+def _stub_fallback(stub: dict[str, Any]) -> dict[str, Any]:
+    item_id = int(stub.get("id") or 0)
+    return normalize_item(
+        {
+            "id": item_id,
+            "itemType": str(stub.get("itemType") or "Asset"),
+            "name": f"Item {item_id}",
+            "_detailsUnavailable": True,
+        },
+        stub,
+    )
 
 
 def is_free_item(item: dict[str, Any]) -> bool:
@@ -90,6 +104,31 @@ class CatalogService:
 
     async def warm_start(self) -> None:
         await self.refresh(force=True)
+        await self.warm_details()
+
+    async def warm_details(self) -> None:
+        missing = self.cache.missing_stubs()
+        total = len(missing)
+        if total <= 0:
+            print(f"[madoka] details cache complete · {len(self.cache.details)} entries")
+            return
+
+        print(f"[madoka] warming details for {total} item(s)...")
+        done = 0
+        for i in range(0, total, DETAILS_BATCH):
+            chunk = missing[i : i + DETAILS_BATCH]
+            await self.hydrate_stubs(chunk)
+            done += len(chunk)
+            if done == len(chunk) or done % 500 == 0 or done >= total:
+                print(f"[madoka] details warm {done}/{total}")
+            if i + DETAILS_BATCH < total:
+                await asyncio.sleep(0.15)
+
+        failed = len(self.cache.failed_detail_ids())
+        print(
+            f"[madoka] details cache ready · {len(self.cache.details)} cached"
+            + (f" · {failed} failed" if failed else "")
+        )
 
     async def refresh(self, *, force: bool = False) -> CatalogDiff | None:
         new_stubs = await self.http.search_items()
@@ -114,7 +153,34 @@ class CatalogService:
                     self.cache.drop_details(_stub_key(stub))
 
             self.cache.save()
-            return diff
+
+        if diff is not None:
+            stale = list(diff.added)
+            stale.extend(new for _old, new in diff.changed)
+            if stale:
+                await self.fetch_fresh_stubs(stale)
+
+        return diff
+
+    async def _fetch_detail_entries(self, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not entries:
+            return []
+        try:
+            rows = await self.http.item_details(entries)
+            return [normalize_item(row) for row in rows]
+        except MadxkaApiError as e:
+            if len(entries) == 1:
+                item_id = int(entries[0].get("id") or 0)
+                print(f"[madoka] details unavailable for id {item_id}: {e.status}")
+                if item_id:
+                    async with self._lock:
+                        self.cache.mark_details_failed(item_id)
+                        self.cache.save()
+                return []
+            mid = len(entries) // 2
+            left = await self._fetch_detail_entries(entries[:mid])
+            right = await self._fetch_detail_entries(entries[mid:])
+            return left + right
 
     async def fetch_details(self, stubs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if not stubs:
@@ -127,8 +193,7 @@ class CatalogService:
         out: list[dict[str, Any]] = []
         for i in range(0, len(entries), DETAILS_BATCH):
             chunk = entries[i : i + DETAILS_BATCH]
-            rows = await self.http.item_details(chunk)
-            out.extend(rows)
+            out.extend(await self._fetch_detail_entries(chunk))
             if i + DETAILS_BATCH < len(entries):
                 await asyncio.sleep(0.15)
         return out
@@ -140,7 +205,7 @@ class CatalogService:
             key = _stub_key(stub)
             cached = self.cache.get_details(key)
             if cached and self.cache.stub_matches(key, stub):
-                ready.append(cached)
+                ready.append(normalize_item(cached, stub))
             else:
                 missing.append(stub)
 
@@ -149,20 +214,57 @@ class CatalogService:
             by_id = {int(row.get("id") or 0): row for row in fetched}
             async with self._lock:
                 for stub in missing:
-                    row = by_id.get(int(stub.get("id") or 0))
+                    item_id = int(stub.get("id") or 0)
+                    if self.cache.is_details_failed(item_id):
+                        continue
+                    row = by_id.get(item_id)
                     if row:
-                        self.cache.put_details(_stub_key(stub), stub, row)
-                        ready.append(row)
+                        normalized = normalize_item(row, stub)
+                        self.cache.put_details(_stub_key(stub), stub, normalized)
+                        ready.append(normalized)
                 self.cache.save()
 
         return ready
 
+    async def fetch_fresh_stubs(self, stubs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not stubs:
+            return []
+        fetched = await self.fetch_details(stubs)
+        by_id = {int(row.get("id") or 0): row for row in fetched}
+        out: list[dict[str, Any]] = []
+        async with self._lock:
+            for stub in stubs:
+                item_id = int(stub.get("id") or 0)
+                key = _stub_key(stub)
+                if self.cache.is_details_failed(item_id):
+                    cached = self.cache.get_details(key)
+                    if cached:
+                        out.append(normalize_item(cached, stub))
+                    continue
+                row = by_id.get(item_id)
+                if row:
+                    normalized = normalize_item(row, stub)
+                    self.cache.put_details(key, stub, normalized)
+                    out.append(normalized)
+                    continue
+                cached = self.cache.get_details(key)
+                if cached and self.cache.stub_matches(key, stub):
+                    out.append(normalize_item(cached, stub))
+                else:
+                    out.append(_stub_fallback(stub))
+            self.cache.save()
+        return out
+
     async def lookup_inspect(self, item_id: int) -> tuple[dict[str, Any], dict[str, Any] | None, str | None] | None:
-        row = await self.lookup_id(item_id)
+        row = await self.lookup_id(item_id, force=True)
         if not row:
             return None
         stub = self.cache.find_stub(item_id)
-        thumb = await self.http.asset_thumbnail(item_id)
+        try:
+            thumb = await self.http.asset_thumbnail(item_id)
+        except Exception as e:
+            print(f"[madoka] thumbnail failed for id {item_id}: {e}")
+            thumb = None
         return row, stub, thumb
 
     async def resolve_query(self, query: str, *, limit: int = 25) -> tuple[str, list[dict[str, Any]]]:
@@ -181,10 +283,12 @@ class CatalogService:
         if not hits:
             return "missing", []
         if len(hits) == 1:
-            return "single", hits
+            item_id = int(hits[0].get("id") or 0)
+            row = await self.lookup_id(item_id, force=True)
+            return "single", [row or hits[0]]
         return "pick", hits
 
-    async def lookup_id(self, item_id: int) -> dict[str, Any] | None:
+    async def lookup_id(self, item_id: int, *, force: bool = False) -> dict[str, Any] | None:
         await self.ensure_loaded()
         stub = self.cache.find_stub(item_id)
         if stub is None:
@@ -193,18 +297,20 @@ class CatalogService:
             if stub is None:
                 return None
             if diff and diff.added:
-                await self.hydrate_stubs([stub])
-                return self.cache.get_details(_stub_key(stub))
+                rows = await self.fetch_fresh_stubs([stub])
+                return rows[0] if rows else None
 
         key = _stub_key(stub)
         cached = self.cache.get_details(key)
-        if cached and self.cache.stub_matches(key, stub):
-            return cached
+        if not force and cached and self.cache.stub_matches(key, stub):
+            return normalize_item(cached, stub)
 
         rows = await self.fetch_details([stub])
         if not rows:
-            return cached
-        row = rows[0]
+            if cached:
+                return normalize_item(cached, stub)
+            return _stub_fallback(stub)
+        row = normalize_item(rows[0], stub)
         async with self._lock:
             self.cache.put_details(key, stub, row)
             self.cache.save()
@@ -217,30 +323,12 @@ class CatalogService:
             return []
 
         hits: list[dict[str, Any]] = []
-        need: list[dict[str, Any]] = []
-
-        for stub in self.cache.stubs:
-            key = _stub_key(stub)
-            cached = self.cache.get_details(key)
-            if cached and self.cache.stub_matches(key, stub):
-                name = str(cached.get("name") or "").lower()
-                if q in name:
-                    hits.append(cached)
-            else:
-                need.append(stub)
-
-        if need and len(hits) < limit:
-            for i in range(0, len(need), DETAILS_BATCH):
-                chunk = need[i : i + DETAILS_BATCH]
-                rows = await self.hydrate_stubs(chunk)
-                for row in rows:
-                    name = str(row.get("name") or "").lower()
-                    if q in name:
-                        hits.append(row)
-                    if len(hits) >= limit:
-                        break
-                if len(hits) >= limit:
-                    break
+        for item in self.cache.iter_cached_items():
+            name = str(item.get("name") or "").lower()
+            if q not in name:
+                continue
+            stub = self.cache.find_stub(int(item.get("id") or 0))
+            hits.append(normalize_item(item, stub) if stub else item)
 
         hits.sort(key=lambda r: str(r.get("name") or "").lower())
         return hits[:limit]
@@ -288,4 +376,6 @@ class CatalogService:
             "fetched_at": fetched,
             "checked_at": meta.get("checked_at"),
             "details_cached": len(self.cache.details),
+            "details_failed": len(self.cache.failed_detail_ids()),
+            "details_missing": len(self.cache.missing_stubs()),
         }

@@ -17,12 +17,15 @@ from bot.embeds import (
 )
 from bot.poll_window import PollWindow
 from bot.views import InspectPickView, InspectView, send_inspect
+from catalog.filter import is_trap_item
 from catalog.item_kind import is_clothing
+from catalog.restrictions import is_limited
 from catalog.service import CatalogService
 from config.settings import Settings
 from economy.service import EconomyService
 from madxka.http import MadxkaHttp
 from store.cache import CatalogCache
+from store.ignore import IgnoreStore
 
 
 def _is_admin(interaction: discord.Interaction) -> bool:
@@ -46,6 +49,7 @@ class MadokaBot(commands.Bot):
         self.api = MadxkaHttp(settings.cookie)
         self.catalog = CatalogService(self.api, self.cache)
         self.economy = EconomyService(self.api)
+        self.ignore = IgnoreStore(settings.ignore_path)
         self._watch_channel_cache: discord.abc.Messageable | None = None
         self._poll_window = PollWindow()
 
@@ -55,6 +59,7 @@ class MadokaBot(commands.Bot):
         self.tree.add_command(buy_group)
         self.tree.add_command(catalog_group)
         self.tree.add_command(test_group)
+        self.tree.add_command(ignore_group)
 
     async def _sync_commands(self) -> None:
         self.tree.clear_commands(guild=None)
@@ -157,10 +162,13 @@ class MadokaBot(commands.Bot):
             print(f"[madoka] watch send failed: {e}")
             self._watch_channel_cache = None
 
-    async def _resolve_items(self, stubs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    async def _resolve_items(self, stubs: list[dict[str, Any]], *, fresh: bool = False) -> list[dict[str, Any]]:
         if not stubs:
             return []
-        rows = await self.catalog.hydrate_stubs(stubs)
+        if fresh:
+            rows = await self.catalog.fetch_fresh_stubs(stubs)
+        else:
+            rows = await self.catalog.hydrate_stubs(stubs)
         by_id = {int(r.get("id") or 0): r for r in rows}
         out: list[dict] = []
         for stub in stubs:
@@ -172,12 +180,34 @@ class MadokaBot(commands.Bot):
                 out.append({"id": item_id, "name": str(item_id)})
         return out
 
+    def _drop_ping(self, item: dict[str, Any]) -> str | None:
+        owner_id = self.settings.wallet_owner_id
+        if is_limited(item):
+            return f"<@{owner_id}>"
+        if not is_clothing(item):
+            return f"<@{owner_id}>"
+        return None
+
+    def _skip_drop(self, item: dict[str, Any]) -> str | None:
+        if is_trap_item(item):
+            return "trap"
+        ignored = self.ignore.matches(item)
+        if ignored:
+            return f"ignore:{ignored}"
+        return None
+
     async def _announce_drop(self, stub: dict[str, Any]) -> None:
-        rows = await self._resolve_items([stub])
-        if not rows:
+        item_id = int(stub.get("id") or 0)
+        item = await self.catalog.lookup_id(item_id, force=False)
+        if not item:
+            rows = await self.catalog.fetch_fresh_stubs([stub])
+            if not rows:
+                return
+            item = rows[0]
+        skip = self._skip_drop(item)
+        if skip:
+            print(f"[madoka] skip `{item_id}` {item.get('name')} ({skip})")
             return
-        item = rows[0]
-        item_id = int(item.get("id") or 0)
         owner_id = self.settings.wallet_owner_id
 
         try:
@@ -195,7 +225,7 @@ class MadokaBot(commands.Bot):
             owner_id=owner_id,
             allow_buy=True,
         )
-        ping = None if is_clothing(item) else f"<@{owner_id}>"
+        ping = self._drop_ping(item)
         await self._watch_send(content=ping, embed=pages[0], view=view)
         print(f"[madoka] drop `{item_id}` {item.get('name')}")
 
@@ -205,8 +235,8 @@ class MadokaBot(commands.Bot):
         if polls <= 0:
             return
 
-        added_rows = await self._resolve_items(list(window.added.values()))
-        changed_rows = await self._resolve_items(list(window.changed.values()))
+        added_rows = await self._resolve_items(list(window.added.values()), fresh=True)
+        changed_rows = await self._resolve_items(list(window.changed.values()), fresh=True)
         removed_rows = await self._resolve_items(list(window.removed.values()))
 
         embed = build_minute_report_embed(
@@ -217,10 +247,15 @@ class MadokaBot(commands.Bot):
             stats=self.catalog.stats(),
         )
 
-        ping_items = added_rows + changed_rows + removed_rows
+        ping_items = [
+            item for item in added_rows + changed_rows + removed_rows
+            if self._skip_drop(item) is None
+        ]
         owner_id = self.settings.wallet_owner_id
         ping = None
-        if any(not is_clothing(item) for item in ping_items):
+        if any(is_limited(item) for item in ping_items):
+            ping = f"<@{owner_id}>"
+        elif any(not is_clothing(item) for item in ping_items):
             ping = f"<@{owner_id}>"
 
         await self._watch_send(content=ping, embed=embed)
@@ -244,8 +279,16 @@ class MadokaBot(commands.Bot):
                             f"[madoka] poll +{len(diff.added)} "
                             f"~{len(diff.changed)} -{len(diff.removed)}"
                         )
-                    for stub in diff.added:
-                        await self._announce_drop(stub)
+                    if diff.changed:
+                        changed_stubs = [new for _old, new in diff.changed]
+                        if self.settings.debug:
+                            print(f"[madoka] refreshed details for {len(changed_stubs)} changed item(s)")
+                    if diff.added:
+                        for stub in diff.added:
+                            await self._announce_drop(stub)
+                    missing = len(self.catalog.cache.missing_stubs())
+                    if missing > 0 and self.settings.debug:
+                        print(f"[madoka] details missing after poll: {missing}")
 
             report_every = max(1, self.settings.poll_report_seconds // self.settings.poll_interval_seconds)
             if self._poll_window.polls >= report_every:
@@ -387,6 +430,7 @@ async def catalog_refresh(interaction: discord.Interaction) -> None:
     await interaction.response.defer(thinking=True)
     try:
         diff = await bot.catalog.refresh(force=True)
+        await bot.catalog.warm_details()
     except Exception as e:
         await interaction.followup.send(f"Refresh failed: `{e}`", ephemeral=True)
         return
@@ -400,7 +444,7 @@ async def catalog_refresh(interaction: discord.Interaction) -> None:
 
     await interaction.followup.send(
         embed=build_diff_embed(
-            added=await bot.catalog.hydrate_stubs(diff.added),
+            added=await bot.catalog.fetch_fresh_stubs(diff.added),
             changed_count=len(diff.changed),
             removed_count=len(diff.removed),
         )
@@ -427,3 +471,60 @@ async def test_random(interaction: discord.Interaction) -> None:
         return
 
     await send_inspect(interaction, bot, row)
+
+
+ignore_group = app_commands.Group(name="ignore", description="Ignore catalog items by name keyword")
+
+
+@ignore_group.command(name="add", description="Ignore items whose name contains a keyword")
+@app_commands.describe(keyword="Case-insensitive substring match on item name")
+async def ignore_add_cmd(interaction: discord.Interaction, keyword: str) -> None:
+    bot = interaction.client
+    assert isinstance(bot, MadokaBot)
+
+    ok, result = bot.ignore.add(keyword)
+    if not ok:
+        if result == "empty":
+            await interaction.response.send_message("Keyword cannot be empty.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"`{keyword.strip().lower()}` is already ignored.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"Added ignore keyword `{result}`.",
+        ephemeral=True,
+    )
+
+
+@ignore_group.command(name="remove", description="Stop ignoring a keyword")
+@app_commands.describe(keyword="Keyword to remove")
+async def ignore_remove_cmd(interaction: discord.Interaction, keyword: str) -> None:
+    bot = interaction.client
+    assert isinstance(bot, MadokaBot)
+
+    ok, result = bot.ignore.remove(keyword)
+    if not ok:
+        await interaction.response.send_message(f"`{keyword.strip().lower()}` is not in the ignore list.", ephemeral=True)
+        return
+
+    await interaction.response.send_message(
+        f"Removed ignore keyword `{result}`.",
+        ephemeral=True,
+    )
+
+
+@ignore_group.command(name="list", description="List ignored name keywords")
+async def ignore_list_cmd(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    assert isinstance(bot, MadokaBot)
+
+    keywords = bot.ignore.list_keywords()
+    if not keywords:
+        await interaction.response.send_message("No ignore keywords set.", ephemeral=True)
+        return
+
+    lines = "\n".join(f"`{k}`" for k in keywords)
+    await interaction.response.send_message(
+        f"**{len(keywords)}** ignore keyword(s):\n{lines}",
+        ephemeral=True,
+    )

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any
 
@@ -53,6 +54,11 @@ class MadxkaHttp:
         self._session: aiohttp.ClientSession | None = None
         self._thumb_cache: dict[int, str | None] = {}
 
+    async def _reset_session(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
     async def start(self) -> None:
         if self._session and not self._session.closed:
             return
@@ -76,9 +82,7 @@ class MadxkaHttp:
         )
 
     async def close(self) -> None:
-        if self._session and not self._session.closed:
-            await self._session.close()
-        self._session = None
+        await self._reset_session()
 
     async def _request(
         self,
@@ -90,38 +94,56 @@ class MadxkaHttp:
         body: Any | None = None,
         extra_headers: dict[str, str] | None = None,
     ) -> Any:
-        await self.start()
-        assert self._session is not None
         url = f"{host}{path}"
         verb = method.upper()
+        last_err: BaseException | None = None
 
-        async def _do(extra: dict[str, str] | None = None) -> tuple[int, str, str, Any | None]:
-            headers = extra or None
-            async with self._session.request(
-                verb,
-                url,
-                params=params,
-                json=body,
-                headers=headers,
-            ) as resp:
-                text = await resp.text()
-                payload: Any | None = None
-                if "json" in (resp.content_type or ""):
-                    try:
-                        payload = json.loads(text)
-                    except json.JSONDecodeError:
-                        payload = None
-                return resp.status, text, resp.headers.get("x-csrf-token") or "", payload
+        for attempt in range(2):
+            await self.start()
+            assert self._session is not None
 
-        status, text, csrf, payload = await _do(extra_headers)
-        if status == 403 and verb in MUTATING and csrf:
-            status, text, _csrf, payload = await _do({"X-CSRF-TOKEN": csrf})
+            async def _do(extra: dict[str, str] | None = None) -> tuple[int, str, str, Any | None]:
+                headers = extra or None
+                async with self._session.request(
+                    verb,
+                    url,
+                    params=params,
+                    json=body,
+                    headers=headers,
+                ) as resp:
+                    text = await resp.text()
+                    payload: Any | None = None
+                    if "json" in (resp.content_type or ""):
+                        try:
+                            payload = json.loads(text)
+                        except json.JSONDecodeError:
+                            payload = None
+                    return resp.status, text, resp.headers.get("x-csrf-token") or "", payload
 
-        if status >= 400:
-            raise MadxkaApiError(status, url, text)
-        if payload is not None:
-            return payload
-        return text
+            try:
+                status, text, csrf, payload = await _do(extra_headers)
+                if status == 403 and verb in MUTATING and csrf:
+                    status, text, _csrf, payload = await _do({"X-CSRF-TOKEN": csrf})
+
+                if status >= 400:
+                    if status >= 500:
+                        await self._reset_session()
+                    raise MadxkaApiError(status, url, text)
+                if payload is not None:
+                    return payload
+                return text
+            except MadxkaApiError:
+                raise
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+                last_err = e
+                await self._reset_session()
+                if attempt == 0:
+                    continue
+                raise
+
+        if last_err:
+            raise last_err
+        raise RuntimeError("request failed")
 
     async def search_items(self, *, limit: int = 99999) -> list[dict[str, Any]]:
         payload = await self._request(API, "GET", "/catalog/v1/search/items", params={"limit": limit})
