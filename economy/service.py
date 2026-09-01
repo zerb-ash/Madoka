@@ -62,6 +62,19 @@ class EconomyService:
             "tickets": int(currency.get("tickets") or 0),
         }
 
+    async def owns_item(self, user_id: int, item: dict[str, Any]) -> bool:
+        asset_id = int(item.get("id") or 0)
+        if not asset_id:
+            return False
+        asset_type = item.get("assetType")
+        if asset_type is not None:
+            return await self.http.user_owns_asset(
+                user_id,
+                asset_id,
+                asset_type_id=int(asset_type),
+            )
+        return await self.http.user_owns_asset(user_id, asset_id)
+
     async def purchase(
         self,
         item: dict[str, Any],
@@ -106,7 +119,11 @@ class EconomyService:
             label = f"[{i}/{total}] `{asset_id}` {name}"
 
             try:
-                owned = await self.http.user_owns_asset(uid, asset_id)
+                owned = await self.http.user_owns_asset(
+                    uid,
+                    asset_id,
+                    asset_type_id=int(asset_type) if (asset_type := item.get("assetType")) is not None else None,
+                )
             except Exception as e:
                 _log(f"{label} · own-check failed: {e}")
                 failed.append((item, f"own-check failed: {e}"))

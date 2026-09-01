@@ -7,7 +7,8 @@ from typing import Any
 import aiohttp
 from yarl import URL
 
-from madxka.urls import API
+from madxka.inventory import parse_inventory_payload
+from madxka.urls import API, SITE
 from madxka.thumbnails import THUMB_BATCH, THUMB_FORMAT, THUMB_SIZE, parse_thumb_rows
 
 MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -233,11 +234,71 @@ class MadxkaHttp:
             raise MadxkaApiError(500, f"{API}/economy/v1/users/{user_id}/currency", "bad payload")
         return payload
 
-    async def user_owns_asset(self, user_id: int, asset_id: int) -> bool:
+    async def inventory_list(
+        self,
+        user_id: int,
+        asset_type_id: int,
+        *,
+        cursor: str = "",
+        items_per_page: int = 99999,
+    ) -> dict[str, Any]:
+        payload = await self._request(
+            SITE,
+            "GET",
+            "/users/inventory/list-json",
+            params={
+                "userId": int(user_id),
+                "assetTypeId": int(asset_type_id),
+                "cursor": cursor or "",
+                "itemsPerPage": int(items_per_page),
+            },
+        )
+        if not isinstance(payload, dict):
+            return {"items": [], "next_cursor": None, "total": 0}
+        items, next_cursor, total = parse_inventory_payload(payload)
+        return {"items": items, "next_cursor": next_cursor, "total": total}
+
+    async def inventory_all(
+        self,
+        user_id: int,
+        asset_type_id: int,
+        *,
+        items_per_page: int = 99999,
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        cursor = ""
+        while True:
+            page = await self.inventory_list(
+                user_id,
+                asset_type_id,
+                cursor=cursor,
+                items_per_page=items_per_page,
+            )
+            batch = page.get("items") or []
+            if isinstance(batch, list):
+                out.extend(batch)
+            nxt = page.get("next_cursor")
+            if not nxt or not batch:
+                break
+            cursor = str(nxt)
+        return out
+
+    async def user_owns_asset(
+        self,
+        user_id: int,
+        asset_id: int,
+        *,
+        asset_type_id: int | None = None,
+    ) -> bool:
+        asset_id = int(asset_id)
+        if asset_type_id is not None:
+            rows = await self.inventory_all(user_id, int(asset_type_id))
+            return any(int(row.get("asset_id") or 0) == asset_id for row in rows)
+
         payload = await self._request(
             API,
             "GET",
-            f"/inventory/v1/users/{int(user_id)}/items/Asset/{int(asset_id)}",
+            f"/inventory/v1/users/{int(user_id)}/items/Asset/{asset_id}",
         )
         if not isinstance(payload, dict):
             return False

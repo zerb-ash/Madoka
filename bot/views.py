@@ -4,8 +4,9 @@ from typing import Any, TYPE_CHECKING
 
 import discord
 
-from bot.auth import can_use_wallet, deny_runner, deny_wallet, is_runner
+from bot.auth import can_use_wallet, deny_wallet, is_runner
 from bot.embeds import build_inspect_pages, build_purchase_embed
+from bot.panels import OwnerPanelView, PANEL_TIMEOUT
 from economy.guard import is_purchase_blocked
 from economy.service import CURRENCY_ROBUX, CURRENCY_TICKETS
 
@@ -16,7 +17,10 @@ if TYPE_CHECKING:
 async def _check_runner(interaction: discord.Interaction, owner_id: int) -> bool:
     if is_runner(interaction, owner_id):
         return True
-    await deny_runner(interaction)
+    if interaction.response.is_done():
+        await interaction.followup.send("This panel isn't yours.", ephemeral=True)
+    else:
+        await interaction.response.send_message("This panel isn't yours.", ephemeral=True)
     return False
 
 
@@ -133,7 +137,7 @@ class BuyButton(discord.ui.Button):
         )
 
 
-class InspectView(discord.ui.View):
+class InspectView(OwnerPanelView):
     def __init__(
         self,
         bot: MadokaBot,
@@ -142,13 +146,12 @@ class InspectView(discord.ui.View):
         pages: list[discord.Embed],
         owner_id: int,
         allow_buy: bool = True,
-        timeout: float = 600,
+        timeout: float = PANEL_TIMEOUT,
     ) -> None:
-        super().__init__(timeout=timeout)
+        super().__init__(owner_id=owner_id, timeout=timeout)
         self.bot = bot
         self.item = item
         self.pages = pages
-        self.owner_id = owner_id
         if allow_buy and not is_purchase_blocked(item):
             if _can_buy_robux(item) or item.get("isForSale") is False:
                 self.add_item(
@@ -170,7 +173,7 @@ class InspectView(discord.ui.View):
                 )
 
 
-class InspectPickView(discord.ui.View):
+class InspectPickView(OwnerPanelView):
     def __init__(
         self,
         bot: MadokaBot,
@@ -179,13 +182,12 @@ class InspectPickView(discord.ui.View):
         results: list[dict[str, Any]],
         owner_id: int,
         allow_buy: bool = False,
-        timeout: float = 600,
+        timeout: float = PANEL_TIMEOUT,
     ) -> None:
-        super().__init__(timeout=timeout)
+        super().__init__(owner_id=owner_id, timeout=timeout)
         self.bot = bot
         self.query = query
         self.results = results
-        self.owner_id = owner_id
         self.allow_buy = allow_buy
         options: list[discord.SelectOption] = []
         for item in results[:25]:
@@ -220,8 +222,6 @@ class InspectPickView(discord.ui.View):
         self.add_item(select)
 
     async def _on_pick(self, interaction: discord.Interaction) -> None:
-        if not await _check_runner(interaction, self.owner_id):
-            return
         assert isinstance(interaction.data, dict)
         values = interaction.data.get("values") or []
         if not values:
@@ -251,7 +251,8 @@ class InspectPickView(discord.ui.View):
             owner_id=self.owner_id,
             allow_buy=allow_buy,
         )
-        await interaction.edit_original_response(embed=pages[0], view=view)
+        msg = await interaction.edit_original_response(embed=pages[0], view=view)
+        view.message = msg
 
 
 async def send_inspect(
@@ -273,4 +274,5 @@ async def send_inspect(
         owner_id=interaction.user.id,
         allow_buy=allow_buy,
     )
-    await interaction.followup.send(embed=pages[0], view=view)
+    msg = await interaction.followup.send(embed=pages[0], view=view)
+    view.message = msg

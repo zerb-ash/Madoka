@@ -5,24 +5,36 @@ from typing import Any, Pattern
 
 _TRAP_PHRASES: tuple[str, ...] = (
     "buy this=ban",
+    "buy this = ban",
     "catching limited snipers",
     "catch item snipers",
     "do not buy this",
     "you will get banned",
     "this is to catch item snipers",
+    "no buy",
+    "item sniper",
+    "item snipers",
+    "buy and you will be banned",
+    "don't buy",
+    "dont buy"
 )
 
 _BLOCK_PATTERNS: tuple[Pattern[str], ...] = (
+    re.compile(r"ban", re.I),
     re.compile(r"do\s*not\s*buy", re.I),
     re.compile(r"don'?t\s*buy", re.I),
+    re.compile(r"no\s*buy", re.I),
     re.compile(r"do\s*not\s*purchase", re.I),
+    re.compile(r"don'?t\s*purchase", re.I),
     re.compile(r"item\s*snipe", re.I),
     re.compile(r"you\s*will\s*get\s*banned", re.I),
-    re.compile(r"if\s*you\s*buy.*banned", re.I),
-    re.compile(r"get\s*banned", re.I),
-    re.compile(r"will\s*be\s*banned", re.I),
+    re.compile(r"if\s*you\s*buy.*bann?ed", re.I),
+    re.compile(r"get\s*bann?ed", re.I),
+    re.compile(r"will\s*be\s*bann?ed", re.I),
     re.compile(r"buy\s*this\s*=\s*ban", re.I),
+    re.compile(r"buy\s*=\s*ban", re.I),
     re.compile(r"catch(?:ing)?\s*limited\s*snipers?", re.I),
+    re.compile(r"catch(?:ing)?\s*item\s*snipers?", re.I),
 )
 
 

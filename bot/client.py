@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import discord
@@ -15,6 +16,7 @@ from bot.embeds import (
     build_inspect_pages,
     build_minute_report_embed,
 )
+from bot.inventory_views import InventoryTypeView
 from bot.poll_window import PollWindow
 from bot.views import InspectPickView, InspectView, send_inspect
 from catalog.filter import is_trap_item
@@ -23,6 +25,7 @@ from catalog.restrictions import is_limited
 from catalog.service import CatalogService
 from config.settings import Settings
 from economy.service import EconomyService
+from economy.snipe import auto_snipe_limited
 from madxka.http import MadxkaHttp
 from store.cache import CatalogCache
 from store.ignore import IgnoreStore
@@ -60,6 +63,7 @@ class MadokaBot(commands.Bot):
         self.tree.add_command(catalog_group)
         self.tree.add_command(test_group)
         self.tree.add_command(ignore_group)
+        self.tree.add_command(check_group)
 
     async def _sync_commands(self) -> None:
         self.tree.clear_commands(guild=None)
@@ -151,16 +155,20 @@ class MadokaBot(commands.Bot):
         content: str | None = None,
         embed: discord.Embed | None = None,
         view: discord.ui.View | None = None,
-    ) -> None:
+    ) -> discord.Message | None:
         channel = await self._watch_channel()
         if channel is None:
             print("[madoka] watch send skipped: no channel")
-            return
+            return None
         try:
-            await channel.send(content=content, embed=embed, view=view)
+            msg = await channel.send(content=content, embed=embed, view=view)
+            if view is not None:
+                view.message = msg
+            return msg
         except Exception as e:
             print(f"[madoka] watch send failed: {e}")
             self._watch_channel_cache = None
+            return None
 
     async def _resolve_items(self, stubs: list[dict[str, Any]], *, fresh: bool = False) -> list[dict[str, Any]]:
         if not stubs:
@@ -196,6 +204,27 @@ class MadokaBot(commands.Bot):
             return f"ignore:{ignored}"
         return None
 
+    async def _refresh_item(self, item_id: int) -> dict[str, Any] | None:
+        return await self.catalog.lookup_id(item_id, force=True)
+
+    def _start_auto_snipe(self, item: dict[str, Any]) -> None:
+        if not is_limited(item):
+            return
+        if is_trap_item(item):
+            return
+
+        async def _run() -> None:
+            try:
+                await auto_snipe_limited(
+                    self.economy,
+                    item=item,
+                    refresh_item=self._refresh_item,
+                )
+            except Exception as e:
+                print(f"[auto-snipe] error `{item.get('id')}`: {e}")
+
+        asyncio.create_task(_run())
+
     async def _announce_drop(self, stub: dict[str, Any]) -> None:
         item_id = int(stub.get("id") or 0)
         item = await self.catalog.lookup_id(item_id, force=False)
@@ -208,6 +237,8 @@ class MadokaBot(commands.Bot):
         if skip:
             print(f"[madoka] skip `{item_id}` {item.get('name')} ({skip})")
             return
+
+        self._start_auto_snipe(item)
         owner_id = self.settings.wallet_owner_id
 
         try:
@@ -339,10 +370,11 @@ async def inspect_cmd(interaction: discord.Interaction, query: str) -> None:
             allow_buy=allow_buy,
             owner_id=interaction.user.id,
         )
-        await interaction.followup.send(
+        msg = await interaction.followup.send(
             content=f"**{len(rows)}** matches for `{q}`. Pick one:",
             view=view,
         )
+        view.message = msg
         return
 
     await send_inspect(interaction, bot, rows[0])
@@ -528,3 +560,38 @@ async def ignore_list_cmd(interaction: discord.Interaction) -> None:
         f"**{len(keywords)}** ignore keyword(s):\n{lines}",
         ephemeral=True,
     )
+
+
+check_group = app_commands.Group(name="check", description="Check account data")
+
+
+@check_group.command(name="inventory", description="Browse your inventory by item type")
+async def check_inventory_cmd(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    assert isinstance(bot, MadokaBot)
+
+    if not can_use_wallet(interaction, bot.settings):
+        await deny_wallet(interaction)
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    try:
+        user = await bot.economy.session_user()
+    except Exception as e:
+        await interaction.followup.send(f"Session lookup failed: `{e}`", ephemeral=True)
+        return
+
+    uid = int(user.get("id") or 0)
+    name = str(user.get("displayName") or user.get("name") or "?").strip() or "?"
+    view = InventoryTypeView(
+        bot,
+        owner_id=interaction.user.id,
+        user_id=uid,
+        user_name=name,
+    )
+    msg = await interaction.followup.send(
+        content=f"Pick an item type for **{name}** (`{uid}`):",
+        view=view,
+        ephemeral=True,
+    )
+    view.message = msg
