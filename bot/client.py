@@ -20,12 +20,13 @@ from bot.inventory_views import InventoryTypeView
 from bot.poll_window import PollWindow
 from bot.views import InspectPickView, InspectView, send_inspect
 from catalog.filter import is_trap_item
-from catalog.item_kind import is_clothing
-from catalog.restrictions import is_limited
+from catalog.item_kind import can_be_limited
+from catalog.restrictions import is_limited, is_limited_unique
 from catalog.service import CatalogService
 from config.settings import Settings
 from economy.service import EconomyService
-from economy.snipe import auto_snipe_limited
+from economy.snipe import LIMITED_RECHECK_SECONDS, watch_limited_then_snipe
+from madxka.urls import catalog_item
 from madxka.http import MadxkaHttp
 from store.cache import CatalogCache
 from store.ignore import IgnoreStore
@@ -189,12 +190,9 @@ class MadokaBot(commands.Bot):
         return out
 
     def _drop_ping(self, item: dict[str, Any]) -> str | None:
-        owner_id = self.settings.wallet_owner_id
-        if is_limited(item):
-            return f"<@{owner_id}>"
-        if not is_clothing(item):
-            return f"<@{owner_id}>"
-        return None
+        if not is_limited(item):
+            return None
+        return f"<@{self.settings.wallet_owner_id}>"
 
     def _skip_drop(self, item: dict[str, Any]) -> str | None:
         if is_trap_item(item):
@@ -207,19 +205,141 @@ class MadokaBot(commands.Bot):
     async def _refresh_item(self, item_id: int) -> dict[str, Any] | None:
         return await self.catalog.lookup_id(item_id, force=True)
 
-    def _start_auto_snipe(self, item: dict[str, Any]) -> None:
-        if not is_limited(item):
+    async def _limited_confirmed(
+        self,
+        item: dict[str, Any],
+        drop_msg: discord.Message | None,
+        *,
+        limited_checks: int | None = None,
+    ) -> None:
+        item_id = int(item.get("id") or 0)
+        owner_id = self.settings.wallet_owner_id
+        ping = f"<@{owner_id}>"
+
+        try:
+            balance = await self.economy.balance()
+        except Exception:
+            balance = None
+        thumb = await self.api.asset_thumbnail(item_id)
+        cache_stub = self.cache.find_stub(item_id)
+        pages = build_inspect_pages(
+            item,
+            stub=cache_stub,
+            thumbnail=thumb,
+            balance=balance,
+            limited_checks=limited_checks,
+            limited_check_max=LIMITED_RECHECK_SECONDS if limited_checks else None,
+        )
+        view = InspectView(
+            self,
+            item=item,
+            pages=pages,
+            owner_id=owner_id,
+            allow_buy=True,
+        )
+
+        if drop_msg is not None:
+            try:
+                await drop_msg.edit(embed=pages[0], view=view)
+                view.message = drop_msg
+            except Exception as e:
+                print(f"[madoka] drop edit failed `{item_id}`: {e}")
+        await self._watch_send(content=ping)
+        print(f"[madoka] limited confirmed `{item_id}` {item.get('name')}")
+
+    async def _update_drop_checks(
+        self,
+        item: dict[str, Any],
+        drop_msg: discord.Message | None,
+        attempt: int,
+    ) -> None:
+        item_id = int(item.get("id") or 0)
+        name = str(item.get("name") or item_id)
+        limited = "yes" if is_limited(item) else "no"
+        limited_u = "yes" if is_limited_unique(item) else "no"
+        await self._watch_send(
+            content=(
+                f"Limited check **{attempt}/{LIMITED_RECHECK_SECONDS}** · "
+                f"[{name}]({catalog_item(item_id, name)}) · "
+                f"Limited {limited} · Limited U {limited_u}"
+            )
+        )
+        if drop_msg is None:
             return
+        try:
+            balance = await self.economy.balance()
+        except Exception:
+            balance = None
+        thumb = await self.api.asset_thumbnail(item_id)
+        cache_stub = self.cache.find_stub(item_id)
+        pages = build_inspect_pages(
+            item,
+            stub=cache_stub,
+            thumbnail=thumb,
+            balance=balance,
+            limited_checks=attempt,
+            limited_check_max=LIMITED_RECHECK_SECONDS,
+        )
+        view = InspectView(
+            self,
+            item=item,
+            pages=pages,
+            owner_id=self.settings.wallet_owner_id,
+            allow_buy=True,
+        )
+        try:
+            await drop_msg.edit(embed=pages[0], view=view)
+            view.message = drop_msg
+        except Exception as e:
+            print(f"[madoka] drop check edit failed `{item_id}`: {e}")
+
+    async def _announce_snipe(self, item: dict[str, Any], result: dict[str, Any]) -> None:
+        if not result.get("purchased"):
+            return
+        item_id = int(item.get("id") or result.get("item_id") or 0)
+        name = str(result.get("name") or item.get("name") or item_id)
+        price = result.get("price")
+        price_text = f"{int(price):,} R$" if price is not None else "—"
+        serial = result.get("serial")
+        serial_text = str(serial) if serial is not None else "—"
+        await self._watch_send(
+            content=(
+                f"[{name}]({catalog_item(item_id, name)}) has been sniped for "
+                f"**{price_text}** got serial **{serial_text}**"
+            )
+        )
+
+    def _start_auto_snipe(self, item: dict[str, Any], drop_msg: discord.Message | None = None) -> None:
         if is_trap_item(item):
             return
+        if not can_be_limited(item):
+            return
+
+        async def _on_check(attempt: int, fresh: dict[str, Any]) -> None:
+            await self._update_drop_checks(fresh, drop_msg, attempt)
+
+        async def _on_limited(fresh: dict[str, Any], attempt: int) -> None:
+            await self._limited_confirmed(fresh, drop_msg, limited_checks=attempt)
 
         async def _run() -> None:
             try:
-                await auto_snipe_limited(
+                result = await watch_limited_then_snipe(
                     self.economy,
                     item=item,
                     refresh_item=self._refresh_item,
+                    on_check=_on_check if not is_limited(item) else None,
+                    on_limited=_on_limited if not is_limited(item) else None,
                 )
+                if result.get("purchased"):
+                    await self._announce_snipe(item, result)
+                elif result.get("limited_checks") and drop_msg is not None and not is_limited(item):
+                    fresh = await self._refresh_item(int(item.get("id") or 0))
+                    if fresh:
+                        await self._update_drop_checks(
+                            fresh,
+                            drop_msg,
+                            int(result.get("limited_checks") or LIMITED_RECHECK_SECONDS),
+                        )
             except Exception as e:
                 print(f"[auto-snipe] error `{item.get('id')}`: {e}")
 
@@ -238,7 +358,6 @@ class MadokaBot(commands.Bot):
             print(f"[madoka] skip `{item_id}` {item.get('name')} ({skip})")
             return
 
-        self._start_auto_snipe(item)
         owner_id = self.settings.wallet_owner_id
 
         try:
@@ -257,7 +376,8 @@ class MadokaBot(commands.Bot):
             allow_buy=True,
         )
         ping = self._drop_ping(item)
-        await self._watch_send(content=ping, embed=pages[0], view=view)
+        drop_msg = await self._watch_send(content=ping, embed=pages[0], view=view)
+        self._start_auto_snipe(item, drop_msg)
         print(f"[madoka] drop `{item_id}` {item.get('name')}")
 
     async def _send_minute_report(self) -> None:
@@ -279,15 +399,10 @@ class MadokaBot(commands.Bot):
         )
 
         ping_items = [
-            item for item in added_rows + changed_rows + removed_rows
-            if self._skip_drop(item) is None
+            item for item in added_rows + changed_rows
+            if self._skip_drop(item) is None and is_limited(item)
         ]
-        owner_id = self.settings.wallet_owner_id
-        ping = None
-        if any(is_limited(item) for item in ping_items):
-            ping = f"<@{owner_id}>"
-        elif any(not is_clothing(item) for item in ping_items):
-            ping = f"<@{owner_id}>"
+        ping = f"<@{self.settings.wallet_owner_id}>" if ping_items else None
 
         await self._watch_send(content=ping, embed=embed)
         print(

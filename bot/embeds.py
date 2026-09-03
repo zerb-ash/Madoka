@@ -122,8 +122,18 @@ def _md_val(val: Any) -> str:
     return str(val)
 
 
-def _inspect_body_md(item: dict[str, Any], item_id: int) -> str:
+def _inspect_body_md(
+    item: dict[str, Any],
+    item_id: int,
+    *,
+    limited_checks: int | None = None,
+    limited_check_max: int | None = None,
+) -> str:
     parts: list[str] = []
+    if limited_checks is not None and limited_checks > 0:
+        max_checks = limited_check_max or limited_checks
+        parts.append(f"**Limited checks:** {limited_checks}/{max_checks}")
+        parts.append("")
     if item.get("_detailsUnavailable"):
         parts.extend(["-# Full details unavailable from catalog API (bad item data on site).", ""])
     desc = str(item.get("description") or "").strip()
@@ -146,6 +156,7 @@ def _inspect_body_md(item: dict[str, Any], item_id: int) -> str:
     parts.append(_md_line("Sales", f"{int(item.get('saleCount') or 0):,}"))
 
     return _cap("\n".join(parts))
+
 
 
 def build_balance_embed(payload: dict[str, Any]) -> discord.Embed:
@@ -402,6 +413,8 @@ def build_inspect_pages(
     stub: dict[str, Any] | None = None,
     thumbnail: str | None = None,
     balance: dict[str, Any] | None = None,
+    limited_checks: int | None = None,
+    limited_check_max: int | None = None,
 ) -> list[discord.Embed]:
     merged = _merged_item(item, stub)
     item_id = int(merged.get("id") or 0)
@@ -410,7 +423,12 @@ def build_inspect_pages(
     embed = discord.Embed(
         title=name,
         url=catalog_item(item_id, name),
-        description=_inspect_body_md(merged, item_id),
+        description=_inspect_body_md(
+            merged,
+            item_id,
+            limited_checks=limited_checks,
+            limited_check_max=limited_check_max,
+        ),
         color=0xEB459E,
         timestamp=datetime.now(timezone.utc),
     )

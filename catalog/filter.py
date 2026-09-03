@@ -16,7 +16,12 @@ _TRAP_PHRASES: tuple[str, ...] = (
     "item snipers",
     "buy and you will be banned",
     "don't buy",
-    "dont buy"
+    "dont buy",
+    "snipe test",
+    "item snipe test",
+    "catching snipers",
+    "item snipe",
+    "sniping items",
 )
 
 _BLOCK_PATTERNS: tuple[Pattern[str], ...] = (
