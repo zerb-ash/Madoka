@@ -21,11 +21,18 @@ from bot.poll_window import PollWindow
 from bot.views import InspectPickView, InspectView, send_inspect
 from catalog.filter import is_trap_item
 from catalog.item_kind import can_be_limited
-from catalog.restrictions import is_limited, is_limited_unique
+from catalog.restrictions import is_limited
 from catalog.service import CatalogService
 from config.settings import Settings
+from drop.flags import DualFlagCoordinator
+from drop.user_monitor import DropUserMonitor
 from economy.service import EconomyService
-from economy.snipe import LIMITED_RECHECK_SECONDS, watch_limited_then_snipe
+from economy.snipe import (
+    limited_check_max,
+    limited_kind_label,
+    remaining_serials,
+    watch_limited_then_snipe,
+)
 from madxka.urls import catalog_item
 from madxka.http import MadxkaHttp
 from store.cache import CatalogCache
@@ -56,6 +63,17 @@ class MadokaBot(commands.Bot):
         self.ignore = IgnoreStore(settings.ignore_path)
         self._watch_channel_cache: discord.abc.Messageable | None = None
         self._poll_window = PollWindow()
+        self.dual_flags = DualFlagCoordinator(
+            economy=self.economy,
+            refresh_item=self._refresh_item,
+            notify=self._flag_notify,
+            flag_wait_seconds=settings.drop.flag_wait_seconds,
+            delay_ms_min=settings.drop.snipe_delay_ms_min,
+            delay_ms_max=settings.drop.snipe_delay_ms_max,
+            safebuy=settings.safebuy,
+            debug=settings.debug,
+        )
+        self._drop_monitor: DropUserMonitor | None = None
 
     def _register_commands(self) -> None:
         self.tree.add_command(inspect_cmd)
@@ -110,6 +128,8 @@ class MadokaBot(commands.Bot):
 
         await self._sync_commands()
 
+        self._start_drop_monitor()
+
         self.watch_loop.change_interval(seconds=self.settings.poll_interval_seconds)
         self.watch_loop.start()
 
@@ -127,6 +147,9 @@ class MadokaBot(commands.Bot):
     async def close(self) -> None:
         if self.watch_loop.is_running():
             self.watch_loop.cancel()
+        if self._drop_monitor is not None:
+            await self._drop_monitor.stop()
+            self._drop_monitor = None
         await self.api.close()
         await super().close()
 
@@ -202,8 +225,92 @@ class MadokaBot(commands.Bot):
             return f"ignore:{ignored}"
         return None
 
+    async def _flag_notify(self, text: str) -> None:
+        print(f"[dual-flag] {text}")
+        await self._watch_send(content=text)
+
     async def _refresh_item(self, item_id: int) -> dict[str, Any] | None:
         return await self.catalog.lookup_id(item_id, force=True)
+
+    def _start_drop_monitor(self) -> None:
+        drop = self.settings.drop
+        if not drop.enabled:
+            print("[drop-monitor] disabled (missing token/channel)")
+            return
+        tokens = [t for t in (drop.user_token, drop.user_token_fallback) if t]
+        channels = drop.watched_channel_ids()
+        if not tokens or not channels:
+            print("[drop-monitor] disabled (incomplete config)")
+            return
+
+        async def on_drop(message) -> None:
+            print(
+                f"[drop-monitor] DROP accepted ids={list(message.item_ids)} "
+                f"test={message.is_test} ping={message.has_ping} "
+                f"flags={self.dual_flags.debug_flags(message.item_ids[0]) if message.item_ids else 'n/a'}"
+            )
+            await self._watch_send(
+                content=(
+                    f"`[drop-debug]` channel drop detected · "
+                    f"ids=`{', '.join(str(i) for i in message.item_ids)}` · "
+                    f"test={'yes' if message.is_test else 'no'} · "
+                    f"ping={'yes' if message.has_ping else 'no (not required)'}"
+                )
+            )
+            await self.dual_flags.on_channel_drop(message)
+
+        async def on_raw(_raw, message) -> None:
+            # Always mirror heard messages into watch channel so you can tell it's alive.
+            preview = (message.content or "(empty)").replace("\n", " | ")[:140]
+            kind = "DROP" if message.is_drop else "heard"
+            await self._watch_send(
+                content=(
+                    f"`[drop-debug]` {kind} · ch=`{message.channel_id}` · "
+                    f"msg=`{message.message_id}` · "
+                    f"ids=`{', '.join(str(i) for i in message.item_ids) or '—'}` · "
+                    f"ping={'yes' if message.has_ping else 'no'} · {preview}"
+                )
+            )
+
+        async def _boot() -> None:
+            last_err: Exception | None = None
+            test_ids = {drop.test_channel_id} if drop.test_channel_id else set()
+            for i, token in enumerate(tokens, start=1):
+                monitor = DropUserMonitor(
+                    token,
+                    channel_ids=channels,
+                    test_channel_ids=test_ids,
+                    role_id=drop.role_id,
+                    on_drop=on_drop,
+                    on_raw=on_raw,
+                    debug=True,
+                )
+                try:
+                    me = await monitor.probe_auth()
+                    print(
+                        f"[drop-monitor] auth ok token#{i} · "
+                        f"{me.get('username')}#{me.get('discriminator')} ({me.get('id')})"
+                    )
+                    self._drop_monitor = monitor
+                    monitor.start()
+                    print(f"[drop-monitor] started · channels {sorted(channels)} · test={sorted(test_ids)}")
+                    await self._watch_send(
+                        content=(
+                            f"`[drop-debug]` monitor online as **{me.get('username')}** · "
+                            f"watching `{', '.join(str(c) for c in sorted(channels))}` · "
+                            f"test channel does **not** need a role ping"
+                        )
+                    )
+                    return
+                except Exception as e:
+                    last_err = e
+                    print(f"[drop-monitor] token#{i} failed: {e}")
+                    await monitor.stop()
+            print(f"[drop-monitor] all tokens failed: {last_err}")
+            await self._watch_send(content=f"`[drop-debug]` monitor failed to start · `{last_err}`")
+
+        asyncio.create_task(_boot())
+
 
     async def _limited_confirmed(
         self,
@@ -228,7 +335,7 @@ class MadokaBot(commands.Bot):
             thumbnail=thumb,
             balance=balance,
             limited_checks=limited_checks,
-            limited_check_max=LIMITED_RECHECK_SECONDS if limited_checks else None,
+            limited_check_max=limited_check_max() if limited_checks else None,
         )
         view = InspectView(
             self,
@@ -255,13 +362,18 @@ class MadokaBot(commands.Bot):
     ) -> None:
         item_id = int(item.get("id") or 0)
         name = str(item.get("name") or item_id)
-        limited = "yes" if is_limited(item) else "no"
-        limited_u = "yes" if is_limited_unique(item) else "no"
+        kind = limited_kind_label(item)
+        sales = int(item.get("saleCount") or 0)
+        serials = item.get("serialCount")
+        left = remaining_serials(item)
+        serials_text = f"{int(serials):,}" if serials is not None else "—"
+        left_text = f"{left:,}" if left is not None else "—"
+        checks_max = limited_check_max()
         await self._watch_send(
             content=(
-                f"Limited check **{attempt}/{LIMITED_RECHECK_SECONDS}** · "
+                f"Limited check **{attempt}/{checks_max}** · "
                 f"[{name}]({catalog_item(item_id, name)}) · "
-                f"Limited {limited} · Limited U {limited_u}"
+                f"**{kind}** · sales `{sales:,}` · serials `{serials_text}` · left `{left_text}`"
             )
         )
         if drop_msg is None:
@@ -278,7 +390,7 @@ class MadokaBot(commands.Bot):
             thumbnail=thumb,
             balance=balance,
             limited_checks=attempt,
-            limited_check_max=LIMITED_RECHECK_SECONDS,
+            limited_check_max=checks_max,
         )
         view = InspectView(
             self,
@@ -315,21 +427,45 @@ class MadokaBot(commands.Bot):
         if not can_be_limited(item):
             return
 
+        use_dual = self.settings.drop.enabled
+
         async def _on_check(attempt: int, fresh: dict[str, Any]) -> None:
             await self._update_drop_checks(fresh, drop_msg, attempt)
 
         async def _on_limited(fresh: dict[str, Any], attempt: int) -> None:
             await self._limited_confirmed(fresh, drop_msg, limited_checks=attempt)
+            if use_dual:
+                print(f"[dual-flag] catalog limited ready `{fresh.get('id')}` · {self.dual_flags.debug_flags(int(fresh.get('id') or 0))}")
+                await self.dual_flags.on_catalog_limited(fresh)
 
         async def _run() -> None:
             try:
+                if use_dual and is_limited(item):
+                    await self.dual_flags.on_catalog_limited(item)
+                    return
+
                 result = await watch_limited_then_snipe(
                     self.economy,
                     item=item,
                     refresh_item=self._refresh_item,
                     on_check=_on_check if not is_limited(item) else None,
                     on_limited=_on_limited if not is_limited(item) else None,
+                    buy=not use_dual,
                 )
+                if use_dual:
+                    # watch_limited_then_snipe only buys when not dual; if limited mid-check,
+                    # on_limited already armed catalog flag.
+                    if result.get("limited_checks") and drop_msg is not None and not is_limited(item):
+                        if not result.get("purchased"):
+                            fresh = await self._refresh_item(int(item.get("id") or 0))
+                            if fresh:
+                                await self._update_drop_checks(
+                                    fresh,
+                                    drop_msg,
+                                    int(result.get("limited_checks") or limited_check_max()),
+                                )
+                    return
+
                 if result.get("purchased"):
                     await self._announce_snipe(item, result)
                 elif result.get("limited_checks") and drop_msg is not None and not is_limited(item):
@@ -338,7 +474,7 @@ class MadokaBot(commands.Bot):
                         await self._update_drop_checks(
                             fresh,
                             drop_msg,
-                            int(result.get("limited_checks") or LIMITED_RECHECK_SECONDS),
+                            int(result.get("limited_checks") or limited_check_max()),
                         )
             except Exception as e:
                 print(f"[auto-snipe] error `{item.get('id')}`: {e}")
@@ -436,10 +572,14 @@ class MadokaBot(commands.Bot):
                     if missing > 0 and self.settings.debug:
                         print(f"[madoka] details missing after poll: {missing}")
 
-            report_every = max(1, self.settings.poll_report_seconds // self.settings.poll_interval_seconds)
+            report_every = max(
+                1,
+                int(round(self.settings.poll_report_seconds / self.settings.poll_interval_seconds)),
+            )
             if self._poll_window.polls >= report_every:
                 await self._send_minute_report()
                 self._poll_window.reset()
+                self.dual_flags.prune()
         except Exception as e:
             print(f"[madoka] poll cycle failed: {e}")
 

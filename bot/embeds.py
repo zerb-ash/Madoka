@@ -153,7 +153,11 @@ def _inspect_body_md(
     serials = item.get("serialCount")
     parts.append(_md_line("Serials", f"{int(serials):,}" if serials is not None else "—"))
     parts.append(_md_line("For sale", _md_val(item.get("isForSale"))))
-    parts.append(_md_line("Sales", f"{int(item.get('saleCount') or 0):,}"))
+    sales = int(item.get("saleCount") or 0)
+    parts.append(_md_line("Sales", f"{sales:,}"))
+    if serials is not None and int(serials) > 0:
+        left = max(0, int(serials) - sales)
+        parts.append(_md_line("Left", f"{left:,}"))
 
     return _cap("\n".join(parts))
 

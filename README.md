@@ -27,8 +27,9 @@ Catalog cache ships in `data/` (`catalog.json`, `catalog-meta.json`, `details-ca
 | `DISCORD_GUILD_ID` | Guild for slash command sync |
 | `WATCH_CHANNEL_ID` | Channel for catalog poll embeds |
 | `WALLET_OWNER_ID` | Discord user id allowed to use wallet commands |
-| `POLL_INTERVAL_SECONDS` | Catalog poll interval in seconds (default 1) |
+| `POLL_INTERVAL_SECONDS` | Catalog poll interval in seconds (default 0.5 → 120/min) |
 | `POLL_REPORT_SECONDS` | Minute report interval in seconds (default 60) |
+| `SAFEBUY` | `true` = during channel buy delay, poll sales and wait for ≥3 (skip serial #1-3); still buys if stock rushes or times out |
 | `DATA_DIR` | Cache directory (default `./data`). On Railway use a volume path like `/data` |
 
 ## Railway
