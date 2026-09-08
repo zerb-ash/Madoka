@@ -290,11 +290,12 @@ class MadxkaHttp:
         *,
         asset_type_id: int | None = None,
     ) -> bool:
+        # asset_type_id kept for call-site compat; never dump full inventory
+        # for a boolean owns check (that starves the bot event loop).
+        _ = asset_type_id
         asset_id = int(asset_id)
-        if asset_type_id is not None:
-            rows = await self.inventory_all(user_id, int(asset_type_id))
-            return any(int(row.get("asset_id") or 0) == asset_id for row in rows)
-
+        if not asset_id:
+            return False
         payload = await self._request(
             API,
             "GET",

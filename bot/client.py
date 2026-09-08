@@ -668,31 +668,49 @@ async def buy_free_cmd(interaction: discord.Interaction) -> None:
 
     await interaction.response.defer(thinking=True, ephemeral=True)
     print("[buy free] command started")
-    try:
-        print("[buy free] refreshing catalog...")
-        await bot.catalog.refresh(force=True)
-        print("[buy free] scanning free on-sale items...")
-        free_items = await bot.catalog.free_items()
-        print(f"[buy free] found {len(free_items)} free on-sale item(s)")
-    except Exception as e:
-        print(f"[buy free] catalog scan failed: {e}")
-        await interaction.followup.send(f"Catalog scan failed: `{e}`", ephemeral=True)
-        return
 
-    if not free_items:
-        print("[buy free] nothing to buy")
-        await interaction.followup.send("No free on-sale items found in the catalog.", ephemeral=True)
-        return
+    # Pause catalog polling so buy-free doesn't starve Discord heartbeats /
+    # minute reports on the shared madxka session.
+    resume_poll = bot.watch_loop.is_running()
+    if resume_poll:
+        bot.watch_loop.cancel()
+        print("[buy free] paused watch_loop")
 
     try:
-        outcome = await bot.economy.purchase_all_free(free_items)
-    except Exception as e:
-        print(f"[buy free] failed: {e}")
-        await interaction.followup.send(f"Buy free failed: `{e}`", ephemeral=True)
-        return
+        try:
+            print("[buy free] refreshing catalog...")
+            await bot.catalog.refresh(force=True)
+            print("[buy free] scanning free on-sale items...")
+            free_items = await bot.catalog.free_items()
+            print(f"[buy free] found {len(free_items)} free on-sale item(s)")
+        except Exception as e:
+            print(f"[buy free] catalog scan failed: {e}")
+            await interaction.followup.send(f"Catalog scan failed: `{e}`", ephemeral=True)
+            return
 
-    print("[buy free] command finished")
-    await interaction.followup.send(embed=build_buy_free_embed(outcome), ephemeral=True)
+        if not free_items:
+            print("[buy free] nothing to buy")
+            await interaction.followup.send("No free on-sale items found in the catalog.", ephemeral=True)
+            return
+
+        try:
+            outcome = await bot.economy.purchase_all_free(free_items)
+        except Exception as e:
+            print(f"[buy free] failed: {e}")
+            await interaction.followup.send(f"Buy free failed: `{e}`", ephemeral=True)
+            return
+
+        print("[buy free] command finished")
+        try:
+            await interaction.followup.send(embed=build_buy_free_embed(outcome), ephemeral=True)
+        except Exception as e:
+            # Interactions expire after ~15m; long runs still finish in console.
+            print(f"[buy free] discord followup failed (run still completed): {e}")
+            await bot._watch_send(embed=build_buy_free_embed(outcome))
+    finally:
+        if resume_poll and not bot.watch_loop.is_running():
+            bot.watch_loop.start()
+            print("[buy free] resumed watch_loop")
 
 
 catalog_group = app_commands.Group(name="catalog", description="Catalog cache and sync")
