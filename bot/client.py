@@ -74,6 +74,7 @@ class MadokaBot(commands.Bot):
             debug=settings.debug,
         )
         self._drop_monitor: DropUserMonitor | None = None
+        self._buy_free_task: asyncio.Task[None] | None = None
 
     def _register_commands(self) -> None:
         self.tree.add_command(inspect_cmd)
@@ -147,6 +148,13 @@ class MadokaBot(commands.Bot):
     async def close(self) -> None:
         if self.watch_loop.is_running():
             self.watch_loop.cancel()
+        if self._buy_free_task and not self._buy_free_task.done():
+            self._buy_free_task.cancel()
+            try:
+                await self._buy_free_task
+            except asyncio.CancelledError:
+                pass
+            self._buy_free_task = None
         if self._drop_monitor is not None:
             await self._drop_monitor.stop()
             self._drop_monitor = None
@@ -667,50 +675,64 @@ async def buy_free_cmd(interaction: discord.Interaction) -> None:
         return
 
     await interaction.response.defer(thinking=True, ephemeral=True)
+
+    if bot._buy_free_task is not None and not bot._buy_free_task.done():
+        await interaction.followup.send(
+            "Buy free is already running in the background.",
+            ephemeral=True,
+        )
+        return
+
     print("[buy free] command started")
-
-    # Pause catalog polling so buy-free doesn't starve Discord heartbeats /
-    # minute reports on the shared madxka session.
-    resume_poll = bot.watch_loop.is_running()
-    if resume_poll:
-        bot.watch_loop.cancel()
-        print("[buy free] paused watch_loop")
-
     try:
-        try:
-            print("[buy free] refreshing catalog...")
-            await bot.catalog.refresh(force=True)
-            print("[buy free] scanning free on-sale items...")
-            free_items = await bot.catalog.free_items()
-            print(f"[buy free] found {len(free_items)} free on-sale item(s)")
-        except Exception as e:
-            print(f"[buy free] catalog scan failed: {e}")
-            await interaction.followup.send(f"Catalog scan failed: `{e}`", ephemeral=True)
-            return
+        print("[buy free] scanning free on-sale items...")
+        free_items = await bot.catalog.free_items()
+        print(f"[buy free] found {len(free_items)} free on-sale item(s)")
+    except Exception as e:
+        print(f"[buy free] catalog scan failed: {e}")
+        await interaction.followup.send(f"Catalog scan failed: `{e}`", ephemeral=True)
+        return
 
-        if not free_items:
-            print("[buy free] nothing to buy")
-            await interaction.followup.send("No free on-sale items found in the catalog.", ephemeral=True)
-            return
+    if not free_items:
+        print("[buy free] nothing to buy")
+        await interaction.followup.send("No free on-sale items found in the catalog.", ephemeral=True)
+        return
 
+    async def _run(items: list[dict[str, Any]]) -> None:
+        # Own HTTP session so purchase traffic never resets the poll/snipe client.
+        buy_http = MadxkaHttp(bot.settings.cookie)
+        buy_economy = EconomyService(buy_http)
         try:
-            outcome = await bot.economy.purchase_all_free(free_items)
+            await bot._watch_send(
+                content=f"`[buy free]` started · `{len(items)}` free item(s) · monitoring stays live"
+            )
+            outcome = await buy_economy.purchase_all_free(items)
+            print("[buy free] command finished")
+            embed = build_buy_free_embed(outcome)
+            await bot._watch_send(embed=embed)
+            try:
+                await interaction.followup.send(embed=embed, ephemeral=True)
+            except Exception as e:
+                print(f"[buy free] discord followup failed (run still completed): {e}")
+        except asyncio.CancelledError:
+            print("[buy free] cancelled")
+            raise
         except Exception as e:
             print(f"[buy free] failed: {e}")
-            await interaction.followup.send(f"Buy free failed: `{e}`", ephemeral=True)
-            return
+            await bot._watch_send(content=f"`[buy free]` failed · `{e}`")
+            try:
+                await interaction.followup.send(f"Buy free failed: `{e}`", ephemeral=True)
+            except Exception:
+                pass
+        finally:
+            await buy_http.close()
 
-        print("[buy free] command finished")
-        try:
-            await interaction.followup.send(embed=build_buy_free_embed(outcome), ephemeral=True)
-        except Exception as e:
-            # Interactions expire after ~15m; long runs still finish in console.
-            print(f"[buy free] discord followup failed (run still completed): {e}")
-            await bot._watch_send(embed=build_buy_free_embed(outcome))
-    finally:
-        if resume_poll and not bot.watch_loop.is_running():
-            bot.watch_loop.start()
-            print("[buy free] resumed watch_loop")
+    bot._buy_free_task = asyncio.create_task(_run(free_items), name="buy-free")
+    await interaction.followup.send(
+        f"Buy free running in background · `{len(free_items)}` items · "
+        "catalog poll + drop monitor stay live.",
+        ephemeral=True,
+    )
 
 
 catalog_group = app_commands.Group(name="catalog", description="Catalog cache and sync")
