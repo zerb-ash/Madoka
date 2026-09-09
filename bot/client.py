@@ -15,6 +15,7 @@ from bot.embeds import (
     build_diff_embed,
     build_inspect_pages,
     build_minute_report_embed,
+    build_promo_redeem_embed,
 )
 from bot.inventory_views import InventoryTypeView
 from bot.poll_window import PollWindow
@@ -35,6 +36,7 @@ from economy.snipe import (
 )
 from madxka.urls import catalog_item
 from madxka.http import MadxkaHttp
+from promo import PromoSnipeService
 from store.cache import CatalogCache
 from store.ignore import IgnoreStore
 
@@ -75,11 +77,19 @@ class MadokaBot(commands.Bot):
         )
         self._drop_monitor: DropUserMonitor | None = None
         self._buy_free_task: asyncio.Task[None] | None = None
+        self.promo = PromoSnipeService(
+            self.api,
+            settings.promo,
+            notify=self._promo_notify,
+            fetch_around=self._promo_fetch_around,
+            fetch_recent=self._promo_fetch_recent,
+        )
 
     def _register_commands(self) -> None:
         self.tree.add_command(inspect_cmd)
         self.tree.add_command(balance_cmd)
         self.tree.add_command(buy_group)
+        self.tree.add_command(redeem_group)
         self.tree.add_command(catalog_group)
         self.tree.add_command(test_group)
         self.tree.add_command(ignore_group)
@@ -237,21 +247,38 @@ class MadokaBot(commands.Bot):
         print(f"[dual-flag] {text}")
         await self._watch_send(content=text)
 
+    async def _promo_notify(self, text: str) -> None:
+        await self._watch_send(content=f"`[promo]` {text}")
+
+    async def _promo_fetch_around(self, channel_id: int, message_id: int) -> list[dict[str, Any]]:
+        mon = self._drop_monitor
+        if mon is None:
+            return []
+        return await mon.fetch_around(channel_id, message_id, limit=5)
+
+    async def _promo_fetch_recent(self, channel_id: int, limit: int) -> list[dict[str, Any]]:
+        mon = self._drop_monitor
+        if mon is None:
+            return []
+        return await mon.fetch_recent(channel_id, limit=limit)
+
     async def _refresh_item(self, item_id: int) -> dict[str, Any] | None:
         return await self.catalog.lookup_id(item_id, force=True)
 
     def _start_drop_monitor(self) -> None:
         drop = self.settings.drop
-        if not drop.enabled:
+        promo = self.settings.promo
+        tokens = [t for t in (drop.user_token, drop.user_token_fallback) if t]
+        channels = drop.watched_channel_ids() | promo.watched_channel_ids()
+        if not tokens or not channels:
             print("[drop-monitor] disabled (missing token/channel)")
             return
-        tokens = [t for t in (drop.user_token, drop.user_token_fallback) if t]
-        channels = drop.watched_channel_ids()
-        if not tokens or not channels:
-            print("[drop-monitor] disabled (incomplete config)")
-            return
+
+        promo_channels = promo.watched_channel_ids()
 
         async def on_drop(message) -> None:
+            if message.channel_id in promo_channels:
+                return
             print(
                 f"[drop-monitor] DROP accepted ids={list(message.item_ids)} "
                 f"test={message.is_test} ping={message.has_ping} "
@@ -267,7 +294,13 @@ class MadokaBot(commands.Bot):
             )
             await self.dual_flags.on_channel_drop(message)
 
-        async def on_raw(_raw, message) -> None:
+        async def on_raw(raw, message) -> None:
+            if message.channel_id in promo_channels:
+                try:
+                    await self.promo.on_discord_message(raw)
+                except Exception as e:
+                    print(f"[promo] handler failed: {e}")
+                return
             # Always mirror heard messages into watch channel so you can tell it's alive.
             preview = (message.content or "(empty)").replace("\n", " | ")[:140]
             kind = "DROP" if message.is_drop else "heard"
@@ -283,6 +316,8 @@ class MadokaBot(commands.Bot):
         async def _boot() -> None:
             last_err: Exception | None = None
             test_ids = {drop.test_channel_id} if drop.test_channel_id else set()
+            if promo.test_channel_id:
+                test_ids.add(promo.test_channel_id)
             for i, token in enumerate(tokens, start=1):
                 monitor = DropUserMonitor(
                     token,
@@ -301,12 +336,18 @@ class MadokaBot(commands.Bot):
                     )
                     self._drop_monitor = monitor
                     monitor.start()
-                    print(f"[drop-monitor] started · channels {sorted(channels)} · test={sorted(test_ids)}")
+                    print(
+                        f"[drop-monitor] started · channels {sorted(channels)} · "
+                        f"test={sorted(test_ids)} · promo={sorted(promo_channels)} · "
+                        f"promo_role={promo.role_id or 'unset'}"
+                    )
+                    asyncio.create_task(self.promo.warm())
                     await self._watch_send(
                         content=(
                             f"`[drop-debug]` monitor online as **{me.get('username')}** · "
                             f"watching `{', '.join(str(c) for c in sorted(channels))}` · "
-                            f"test channel does **not** need a role ping"
+                            f"promo channels `{', '.join(str(c) for c in sorted(promo_channels)) or '—'}` · "
+                            f"promo role `{promo.role_id or 'unset'}`"
                         )
                     )
                     return
@@ -732,6 +773,43 @@ async def buy_free_cmd(interaction: discord.Interaction) -> None:
         f"Buy free running in background · `{len(free_items)}` items · "
         "catalog poll + drop monitor stay live.",
         ephemeral=True,
+    )
+
+
+redeem_group = app_commands.Group(name="redeem", description="Promocode tools")
+
+
+@redeem_group.command(name="existing", description="Redeem all parsed codes from promo channels")
+async def redeem_existing_cmd(interaction: discord.Interaction) -> None:
+    bot = interaction.client
+    assert isinstance(bot, MadokaBot)
+
+    if not can_use_wallet(interaction, bot.settings):
+        await deny_wallet(interaction)
+        return
+
+    if bot._drop_monitor is None:
+        await interaction.response.send_message(
+            "Drop/promo monitor is offline · cannot read promo channel history.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(thinking=True, ephemeral=True)
+    print("[promo] redeem existing started")
+    try:
+        outcome = await bot.promo.redeem_existing(limit=100)
+    except Exception as e:
+        print(f"[promo] redeem existing failed: {e}")
+        await interaction.followup.send(f"Redeem existing failed: `{e}`", ephemeral=True)
+        return
+
+    embed = build_promo_redeem_embed(outcome)
+    await bot._watch_send(embed=embed)
+    await interaction.followup.send(embed=embed, ephemeral=True)
+    print(
+        f"[promo] redeem existing done · codes={len(outcome.get('codes') or [])} · "
+        f"claimed={outcome.get('claimed')} failed={outcome.get('failed')}"
     )
 
 

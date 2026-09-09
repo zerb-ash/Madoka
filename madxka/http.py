@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import html as html_lib
 import json
+import re
 from typing import Any
 
 import aiohttp
@@ -13,6 +15,7 @@ from madxka.thumbnails import THUMB_BATCH, THUMB_FORMAT, THUMB_SIZE, parse_thumb
 
 MUTATING = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 MADXKA_ORIGIN = URL("https://madxka.com/")
+PROMO_PAGE = f"{SITE}/internal/promocodes"
 
 
 class MadxkaApiError(RuntimeError):
@@ -54,6 +57,8 @@ class MadxkaHttp:
         self.cookie = format_cookie(self._cookie_raw)
         self._session: aiohttp.ClientSession | None = None
         self._thumb_cache: dict[int, str | None] = {}
+        self._promo_token: str | None = None
+        self._promo_token_lock = asyncio.Lock()
 
     async def _reset_session(self) -> None:
         if self._session and not self._session.closed:
@@ -316,3 +321,164 @@ class MadxkaHttp:
         if not isinstance(payload, dict):
             raise MadxkaApiError(500, f"{API}/economy/v1/purchases/products/{asset_id}", "bad payload")
         return payload
+
+    async def redeem_promocode(self, code: str) -> dict[str, Any]:
+        code = (code or "").strip().upper()
+        if not code:
+            return {"ok": False, "status": "error", "detail": "empty code", "code": code}
+
+        await self.start()
+        assert self._session is not None
+
+        # Prefer a warm antiforgery token so live snipes can POST immediately.
+        token = self._promo_token
+        if not token:
+            token = await self.refresh_promo_token()
+        if not token:
+            raise RuntimeError("promocode antiforgery token missing")
+
+        outcome = await self._post_promo_redeem(code, token)
+        # Refresh in background for the next snipe; retry once if antiforgery failed.
+        asyncio.create_task(self.refresh_promo_token())
+        if outcome.get("status") == "antiforgery":
+            token = await self.refresh_promo_token()
+            if not token:
+                raise RuntimeError("promocode antiforgery token missing")
+            outcome = await self._post_promo_redeem(code, token)
+            asyncio.create_task(self.refresh_promo_token())
+        return outcome
+
+    async def refresh_promo_token(self) -> str | None:
+        async with self._promo_token_lock:
+            await self.start()
+            assert self._session is not None
+            async with self._session.get(
+                PROMO_PAGE,
+                headers={"Accept": "text/html,application/xhtml+xml"},
+            ) as resp:
+                html = await resp.text()
+                if resp.status >= 400:
+                    self._promo_token = None
+                    raise MadxkaApiError(resp.status, PROMO_PAGE, html)
+            token = _extract_antiforgery_token(html)
+            self._promo_token = token
+            return token
+
+    async def _post_promo_redeem(self, code: str, token: str) -> dict[str, Any]:
+        assert self._session is not None
+        form = {
+            "__RequestVerificationToken": token,
+            "code": code,
+            "handler": "redeem",
+        }
+        # Consume cached token so the next redeem refreshes if needed.
+        if self._promo_token == token:
+            self._promo_token = None
+        async with self._session.post(
+            PROMO_PAGE,
+            data=form,
+            headers={
+                "Accept": "text/html,application/xhtml+xml",
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Origin": SITE,
+                "Referer": PROMO_PAGE,
+            },
+            allow_redirects=True,
+        ) as resp:
+            body = await resp.text()
+            status_code = resp.status
+        return _parse_promo_redeem_result(code, status_code, body)
+
+
+def _extract_antiforgery_token(html: str) -> str | None:
+    # Attributes can appear in any order, e.g.
+    # <input name="__RequestVerificationToken" type="hidden" value="..." />
+    patterns = (
+        r'<input[^>]*\bname=["\']__RequestVerificationToken["\'][^>]*\bvalue=["\']([^"\']+)["\']',
+        r'<input[^>]*\bvalue=["\']([^"\']+)["\'][^>]*\bname=["\']__RequestVerificationToken["\']',
+        r'name=["\']__RequestVerificationToken["\'][^>]*value=["\']([^"\']+)["\']',
+        r'value=["\']([^"\']+)["\'][^>]*name=["\']__RequestVerificationToken["\']',
+    )
+    for pat in patterns:
+        m = re.search(pat, html or "", re.I)
+        if m:
+            token = (m.group(1) or "").strip()
+            if token:
+                return token
+    return None
+
+
+def _parse_promo_redeem_result(code: str, status: int, html: str) -> dict[str, Any]:
+    raw = html or ""
+    alert = _extract_alert_text(raw)
+    blob = alert or raw
+    text = html_lib.unescape(re.sub(r"<[^>]+>", " ", blob))
+    text = re.sub(r"\s+", " ", text).strip()
+    lowered = text.lower()
+    raw_l = raw.lower()
+
+    def hit(*needles: str) -> bool:
+        return any(n in lowered for n in needles)
+
+    if status >= 400:
+        return {
+            "ok": False,
+            "status": "http_error",
+            "detail": f"http {status}",
+            "code": code,
+        }
+    if hit("antiforgery", "verification token", "request verification"):
+        return {"ok": False, "status": "antiforgery", "detail": "bad antiforgery token", "code": code}
+    if "alert-success" in raw_l or hit(
+        "successfully redeemed",
+        "redeemed successfully",
+        "code redeemed",
+        "you redeemed",
+        "promo code redeemed",
+    ):
+        return {"ok": True, "status": "claimed", "detail": "redeemed", "code": code}
+
+    if hit("already redeemed", "already claimed", "already used", "you have already"):
+        return {"ok": False, "status": "already", "detail": "already redeemed", "code": code}
+    if hit(
+        "no longer active",
+        "no longer valid",
+        "not active",
+        "is expired",
+        "has expired",
+        "expired",
+    ):
+        return {"ok": False, "status": "inactive", "detail": "promocode is no longer active", "code": code}
+    if hit(
+        "maximum redemption",
+        "max redemption",
+        "out of uses",
+        "no uses left",
+        "fully redeemed",
+        "max uses",
+    ):
+        return {"ok": False, "status": "exhausted", "detail": "maximum redemptions reached", "code": code}
+    if hit("invalid code", "does not exist", "not found", "unknown code", "not valid"):
+        return {"ok": False, "status": "invalid", "detail": "invalid code", "code": code}
+    if "alert-danger" in raw_l or "alert-warning" in raw_l:
+        detail = alert or text
+        detail = re.sub(r"^(Promocodes\s+)+", "", detail, flags=re.I).strip()
+        return {"ok": False, "status": "rejected", "detail": (detail or "rejected")[:160], "code": code}
+
+    snippet = alert or text
+    snippet = re.sub(r"^(Promocodes\s+Back to madxka\.com\s+Promocodes\s+Account Deletion\s+Promocodes\s+)+", "", snippet, flags=re.I)
+    snippet = re.sub(r"^(Promocodes\s+)+", "", snippet, flags=re.I).strip()
+    return {"ok": False, "status": "unknown", "detail": (snippet or f"http {status}")[:160], "code": code}
+
+
+def _extract_alert_text(html: str) -> str | None:
+    m = re.search(
+        r'<div[^>]*class=["\'][^"\']*alert[^"\']*["\'][^>]*>(.*?)</div>',
+        html or "",
+        re.I | re.S,
+    )
+    if not m:
+        return None
+    text = html_lib.unescape(re.sub(r"<[^>]+>", " ", m.group(1)))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text or None

@@ -15,6 +15,7 @@ Catalog cache ships in `data/` (`catalog.json`, `catalog-meta.json`, `details-ca
 - `/inspect` — look up an item by id or name
 - `/balance` — wallet robux and tickets (owner only)
 - `/buy free` — purchase all free on-sale catalog items (owner only)
+- `/redeem existing` — parse promo channel history and redeem every found code (owner only)
 - `/catalog stats` / `/catalog refresh` — cache info and force sync
 - `/test random` — random item inspect
 
@@ -31,6 +32,9 @@ Catalog cache ships in `data/` (`catalog.json`, `catalog-meta.json`, `details-ca
 | `POLL_REPORT_SECONDS` | Minute report interval in seconds (default 60) |
 | `SAFEBUY` | `true` = during channel buy delay, poll sales and wait for ≥3 (skip serial #1-3); still buys if stock rushes or times out |
 | `DATA_DIR` | Cache directory (default `./data`). On Railway use a volume path like `/data` |
+| `PROMO_CHANNEL_ID` | Official promocode channel to snipe |
+| `PROMO_TEST_CHANNEL_ID` | Test promocode channel (no role ping required) |
+| `PROMO_ROLE_ID` | Optional `@Code Pings` role id; when set, official channel requires that ping |
 
 ## Railway
 

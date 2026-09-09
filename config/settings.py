@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from drop import DropMonitorSettings
+from promo import PromoMonitorSettings
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
@@ -58,6 +59,7 @@ class Settings:
     details_path: Path
     ignore_path: Path
     drop: DropMonitorSettings
+    promo: PromoMonitorSettings
     safebuy: bool
 
 
@@ -99,6 +101,11 @@ def load_settings() -> Settings:
         snipe_delay_ms_min=int(delay_min) if delay_min.isdigit() else 50,
         snipe_delay_ms_max=int(delay_max) if delay_max.isdigit() else 200,
     )
+    promo = PromoMonitorSettings(
+        channel_id=_env_int("PROMO_CHANNEL_ID") or 1522635553575534723,
+        test_channel_id=_env_int("PROMO_TEST_CHANNEL_ID") or 1547087951912239225,
+        role_id=_env_int("PROMO_ROLE_ID"),
+    )
 
     return Settings(
         discord_token=(os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN") or "").strip(),
@@ -115,5 +122,6 @@ def load_settings() -> Settings:
         details_path=data / "details-cache.json",
         ignore_path=data / "ignore-keywords.json",
         drop=drop,
+        promo=promo,
         safebuy=os.getenv("SAFEBUY", "").strip().lower() in {"1", "true", "yes", "on"},
     )

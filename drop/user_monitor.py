@@ -81,6 +81,29 @@ class DropUserMonitor:
             data = json.loads(text)
             return list(data) if isinstance(data, list) else []
 
+    async def fetch_around(
+        self,
+        channel_id: int,
+        message_id: int,
+        *,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        await self._ensure_session()
+        assert self._session is not None
+        url = f"{DISCORD_API}/channels/{int(channel_id)}/messages"
+        params = {
+            "around": int(message_id),
+            "limit": max(1, min(100, limit)),
+        }
+        async with self._session.get(url, params=params) as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(f"discord {resp.status}: {text[:300]}")
+            data = json.loads(text)
+            rows = list(data) if isinstance(data, list) else []
+            rows.sort(key=lambda r: int(r.get("id") or 0))
+            return rows
+
     async def probe_auth(self) -> dict[str, Any]:
         await self._ensure_session()
         assert self._session is not None

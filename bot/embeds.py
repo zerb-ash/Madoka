@@ -365,6 +365,41 @@ def build_buy_free_embed(outcome: dict[str, Any]) -> discord.Embed:
     return embed
 
 
+def build_promo_redeem_embed(outcome: dict[str, Any]) -> discord.Embed:
+    results = outcome.get("results") or []
+    claimed = int(outcome.get("claimed") or 0)
+    failed = int(outcome.get("failed") or 0)
+    scanned = int(outcome.get("scanned_messages") or 0)
+    codes = outcome.get("codes") or []
+
+    embed = discord.Embed(
+        title="Redeem existing promocodes",
+        color=0x57F287 if claimed else 0x5865F2,
+        timestamp=datetime.now(timezone.utc),
+    )
+    embed.add_field(name="Messages scanned", value=str(scanned), inline=True)
+    embed.add_field(name="Codes found", value=str(len(codes)), inline=True)
+    embed.add_field(name="Claimed", value=str(claimed), inline=True)
+    embed.add_field(name="Not claimed", value=str(failed), inline=True)
+
+    if results:
+        lines: list[str] = []
+        for row in results[:20]:
+            code = str(row.get("code") or "?")
+            status = str(row.get("status") or ("ok" if row.get("ok") else "failed"))
+            detail = str(row.get("detail") or "")
+            mark = "claimed" if row.get("ok") else status
+            line = f"`{code}` · **{mark}**"
+            if detail and detail.lower() not in {mark.lower(), "redeemed"}:
+                line += f" · {detail[:80]}"
+            lines.append(line)
+        if len(results) > 20:
+            lines.append(f"-# +{len(results) - 20} more")
+        embed.add_field(name="Results", value="\n".join(lines)[:1024], inline=False)
+
+    return embed
+
+
 def build_poll_embed(
     *,
     added: list[dict[str, Any]],

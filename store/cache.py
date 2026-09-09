@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,7 +25,31 @@ def _atomic_write(path: Path, text: str) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp_name, path)
+        last_err: OSError | None = None
+        for attempt in range(8):
+            try:
+                os.replace(tmp_name, path)
+                return
+            except PermissionError as e:
+                # Windows often denies replace while AV/OneDrive holds the dest.
+                last_err = e
+                time.sleep(0.05 * (attempt + 1))
+            except OSError as e:
+                last_err = e
+                if getattr(e, "winerror", None) != 5:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        # Last resort: non-atomic overwrite.
+        try:
+            path.write_text(text, encoding="utf-8")
+        finally:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+        if last_err is not None:
+            # Write succeeded via fallback; don't raise.
+            return
     except Exception:
         try:
             os.unlink(tmp_name)
