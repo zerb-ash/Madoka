@@ -13,8 +13,6 @@ from drop.parser import DropMessage
 from economy.snipe import (
     _serial_supply,
     auto_snipe_limited,
-    await_channel_buy_window,
-    channel_snipe_delay_seconds,
 )
 
 OnNotify = Callable[[str], Awaitable[None]]
@@ -176,12 +174,9 @@ class DualFlagCoordinator:
             state.sniping = True
             item = state.item
 
+        # Prefer cached item for speed; refresh only if we have nothing.
         if item is None:
             item = await self.refresh_item(item_id)
-        else:
-            fresh = await self.refresh_item(item_id)
-            if fresh:
-                item = fresh
 
         if item is None:
             async with self._lock:
@@ -190,45 +185,17 @@ class DualFlagCoordinator:
             return
 
         supply = _serial_supply(item)
-        delay = channel_snipe_delay_seconds(item)
-        mode = "safebuy" if self.safebuy else "delay"
-        self._log(
-            f"both flags true `{item_id}` · supply={supply} · "
-            f"{mode} {delay:.2f}s · source={source}"
-        )
-        await self.notify(
-            f"Both flags true · `{item_id}` **{item.get('name')}** · "
-            f"supply `{supply}` · "
-            + (
-                f"**SAFEBUY** window **{delay:.2f}s** · wait ≥3 sales (skip #1-3) · source `{source}`"
-                if self.safebuy
-                else f"waiting **{delay:.2f}s** then buy · source `{source}`"
+        name = str(item.get("name") or item_id)
+        self._log(f"both flags true `{item_id}` · supply={supply} · INSTANT buy · source={source}")
+        # Don't await Discord notify before the purchase POST.
+        asyncio.create_task(
+            self.notify(
+                f"Both flags true · `{item_id}` **{name}** · supply `{supply}` · "
+                f"**INSTANT buy** · source `{source}`"
             )
         )
 
-        async def _tick(_fresh: dict[str, Any], status: str) -> None:
-            # Avoid spamming watch channel every 0.25s — log only once mid-wait.
-            if item_id in self._safebuy_notified:
-                return
-            self._safebuy_notified.add(item_id)
-            await self.notify(f"`[safebuy]` `{item_id}` · {status}")
-
-        item, gate = await await_channel_buy_window(
-            item,
-            refresh_item=self.refresh_item,
-            delay=delay,
-            safebuy=self.safebuy,
-            on_tick=_tick if self.safebuy else None,
-        )
-        async with self._lock:
-            self._get(item_id).item = item
-        self._safebuy_notified.discard(item_id)
-        if self.safebuy:
-            self._log(f"safebuy gate `{item_id}` · {gate}")
-            await self.notify(f"`[safebuy]` `{item_id}` · buying · {gate}")
-
-        # Allow timed limiteds for channel-gated sales.
-        # Delay / safebuy already applied above — don't add a second instant buy.
+        # Instant channel buy — no SAFEBUY / human delay window.
         result = await auto_snipe_limited(
             self.economy,
             item=item,
@@ -246,11 +213,11 @@ class DualFlagCoordinator:
         if result.get("purchased"):
             price = result.get("price")
             serial = result.get("serial")
-            name = str(result.get("name") or item.get("name") or item_id)
+            bought_name = str(result.get("name") or item.get("name") or item_id)
             await self.notify(
-                f"**{name}** has been sniped for **{int(price):,} R$** got serial **{serial if serial is not None else '—'}**"
+                f"**{bought_name}** has been sniped for **{int(price):,} R$** got serial **{serial if serial is not None else '—'}**"
                 if price is not None
-                else f"**{name}** has been sniped got serial **{serial if serial is not None else '—'}**"
+                else f"**{bought_name}** has been sniped got serial **{serial if serial is not None else '—'}**"
             )
         else:
             await self.notify(

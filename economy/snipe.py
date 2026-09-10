@@ -298,6 +298,30 @@ async def auto_snipe_limited(
         if fresh:
             item = fresh
 
+    price = robux_list_price(item)
+    if price is None:
+        print(f"[auto-snipe] skip {label} · no robux price")
+        return {"ok": False, "reason": "no robux price", "item_id": item_id}
+
+    # Channel-gated path: skip balance/owns round-trips — hit purchase immediately.
+    if skip_serial_delay:
+        if is_trap_item(item) or is_purchase_blocked(item):
+            reason = f"blocked ({trap_reason(item) or 'trap'})"
+            print(f"[auto-snipe] skip {label} · {reason}")
+            return {"ok": False, "reason": reason, "item_id": item_id}
+        if is_egg_item(item):
+            print(f"[auto-snipe] skip {label} · egg")
+            return {"ok": False, "reason": "egg", "item_id": item_id}
+        print(f"[auto-snipe] buying {label} · {price:,} R$ · instant")
+        return await _purchase_with_429_retry(
+            economy,
+            item=item,
+            label=label,
+            price=price,
+            name=name,
+            refresh_item=refresh_item,
+        )
+
     try:
         bal = await economy.balance()
     except Exception as e:
@@ -310,11 +334,6 @@ async def auto_snipe_limited(
         print(f"[auto-snipe] skip {label} · {block}")
         return {"ok": False, "reason": block, "item_id": item_id}
 
-    price = robux_list_price(item)
-    if price is None:
-        print(f"[auto-snipe] skip {label} · no robux price")
-        return {"ok": False, "reason": "no robux price", "item_id": item_id}
-
     user = bal.get("user") or {}
     uid = int(user.get("id") or 0)
     if uid:
@@ -326,31 +345,158 @@ async def auto_snipe_limited(
             print(f"[auto-snipe] own-check failed {label}: {e}")
 
     print(f"[auto-snipe] buying {label} · {price:,} R$ · balance {robux:,}")
-    try:
-        outcome = await economy.purchase(item, currency=CURRENCY_ROBUX)
-    except Exception as e:
-        print(f"[auto-snipe] failed {label}: {e}")
-        return {"ok": False, "reason": str(e), "item_id": item_id}
+    return await _purchase_with_429_retry(
+        economy,
+        item=item,
+        label=label,
+        price=price,
+        name=name,
+        uid=uid,
+        refresh_item=refresh_item,
+    )
 
-    if outcome.get("purchased"):
-        result = outcome.get("result") or {}
-        serial = _serial_from_result(result if isinstance(result, dict) else {})
-        if serial is None and uid:
-            serial = await _owned_serial(economy, item, uid)
-        print(f"[auto-snipe] bought {label} · {price:,} R$ · serial {serial}")
-        return {
-            "ok": True,
-            "purchased": True,
-            "item_id": item_id,
-            "name": name,
-            "price": price,
-            "serial": serial,
-            "outcome": outcome,
-        }
 
-    reason = str(outcome.get("reason") or "declined")
-    print(f"[auto-snipe] declined {label} · {reason}")
-    return {"ok": False, "reason": reason, "item_id": item_id, "outcome": outcome}
+def _is_429(err: str) -> bool:
+    low = (err or "").lower()
+    return "429" in low or "toomanyrequests" in low
+
+
+def _is_out_of_stock(item: dict[str, Any], err: str = "") -> bool:
+    left = remaining_serials(item)
+    if left is not None and left <= 0:
+        return True
+    if item.get("isForSale") is False:
+        return True
+    low = (err or "").lower()
+    needles = (
+        "sold out",
+        "out of stock",
+        "no longer for sale",
+        "not for sale",
+        "insufficient quantity",
+        "none left",
+        "0 remaining",
+        "already sold",
+    )
+    return any(n in low for n in needles)
+
+
+def _is_terminal_purchase_fail(err: str) -> bool:
+    low = (err or "").lower()
+    needles = (
+        "already owned",
+        "insufficient funds",
+        "insufficient robux",
+        "not enough",
+        "blocked",
+        "floodcheck",
+        "moderation",
+    )
+    return any(n in low for n in needles)
+
+
+async def _purchase_with_429_retry(
+    economy: EconomyService,
+    *,
+    item: dict[str, Any],
+    label: str,
+    price: int,
+    name: str,
+    uid: int = 0,
+    refresh_item=None,
+) -> dict[str, Any]:
+    item_id = int(item.get("id") or 0)
+    last_err = ""
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            outcome = await economy.purchase(item, currency=CURRENCY_ROBUX)
+        except Exception as e:
+            last_err = str(e)
+            if _is_out_of_stock(item, last_err):
+                print(f"[auto-snipe] out of stock {label} · {last_err}")
+                return {"ok": False, "reason": "out of stock", "item_id": item_id}
+            if _is_terminal_purchase_fail(last_err):
+                print(f"[auto-snipe] failed {label}: {e}")
+                return {"ok": False, "reason": last_err, "item_id": item_id}
+            if not _is_429(last_err):
+                # Price changed / transient: refresh and keep trying a bit like 429.
+                if "price has changed" in last_err.lower() and refresh_item is not None:
+                    try:
+                        fresh = await refresh_item(item_id)
+                        if fresh:
+                            item = fresh
+                            new_price = robux_list_price(item)
+                            if new_price is not None:
+                                price = new_price
+                    except Exception:
+                        pass
+                elif "500" not in last_err and "InternalServerError" not in last_err:
+                    print(f"[auto-snipe] failed {label}: {e}")
+                    return {"ok": False, "reason": last_err, "item_id": item_id}
+
+            wait = min(1.0, 0.12 + 0.08 * min(attempt, 10))
+            if attempt == 1 or attempt % 5 == 0:
+                print(f"[auto-snipe] 429 retry #{attempt} {label} · sleep {wait:.2f}s")
+            await asyncio.sleep(wait)
+
+            if refresh_item is not None and attempt % 3 == 0:
+                try:
+                    fresh = await refresh_item(item_id)
+                    if fresh:
+                        item = fresh
+                        if _is_out_of_stock(item):
+                            print(f"[auto-snipe] out of stock {label} · left={remaining_serials(item)}")
+                            return {"ok": False, "reason": "out of stock", "item_id": item_id}
+                except Exception:
+                    pass
+            continue
+
+        if outcome.get("purchased"):
+            result = outcome.get("result") or {}
+            serial = _serial_from_result(result if isinstance(result, dict) else {})
+            if serial is None and uid:
+                serial = await _owned_serial(economy, item, uid)
+            print(f"[auto-snipe] bought {label} · {price:,} R$ · serial {serial} · tries={attempt}")
+            return {
+                "ok": True,
+                "purchased": True,
+                "item_id": item_id,
+                "name": name,
+                "price": price,
+                "serial": serial,
+                "outcome": outcome,
+            }
+
+        reason = str(outcome.get("reason") or "declined")
+        if _is_out_of_stock(item, reason):
+            print(f"[auto-snipe] out of stock {label} · {reason}")
+            return {"ok": False, "reason": "out of stock", "item_id": item_id, "outcome": outcome}
+        if _is_429(reason):
+            wait = min(1.0, 0.12 + 0.08 * min(attempt, 10))
+            if attempt == 1 or attempt % 5 == 0:
+                print(f"[auto-snipe] 429 declined retry #{attempt} {label} · sleep {wait:.2f}s")
+            await asyncio.sleep(wait)
+            continue
+        if _is_terminal_purchase_fail(reason):
+            print(f"[auto-snipe] declined {label} · {reason}")
+            return {"ok": False, "reason": reason, "item_id": item_id, "outcome": outcome}
+
+        # Unknown decline — refresh stock once; stop if gone, else treat as hard fail.
+        if refresh_item is not None:
+            try:
+                fresh = await refresh_item(item_id)
+                if fresh:
+                    item = fresh
+                    if _is_out_of_stock(item):
+                        print(f"[auto-snipe] out of stock {label} · left={remaining_serials(item)}")
+                        return {"ok": False, "reason": "out of stock", "item_id": item_id}
+            except Exception:
+                pass
+        print(f"[auto-snipe] declined {label} · {reason}")
+        return {"ok": False, "reason": reason, "item_id": item_id, "outcome": outcome}
 
 
 async def watch_limited_then_snipe(
