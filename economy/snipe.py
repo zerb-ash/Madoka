@@ -17,9 +17,17 @@ LIMITED_POLL_INTERVAL = 0.5  # 120/min details checks while watching a drop
 # Back-compat alias used by embeds / client messages
 LIMITED_RECHECK_SECONDS = LIMITED_WATCH_SECONDS
 
+# Poll for robux listing after limited flag (price often lags serials / Limited U).
+PRICE_WATCH_SECONDS = 15
+PRICE_POLL_INTERVAL = 0.25
+
 
 def limited_check_max() -> int:
     return max(1, int(round(LIMITED_WATCH_SECONDS / LIMITED_POLL_INTERVAL)))
+
+
+def price_check_max() -> int:
+    return max(1, int(round(PRICE_WATCH_SECONDS / PRICE_POLL_INTERVAL)))
 
 
 def _serial_count(item: dict[str, Any]) -> int:
@@ -224,6 +232,72 @@ def robux_list_price(item: dict[str, Any]) -> int | None:
     return int(price)
 
 
+async def await_robux_list_price(
+    item: dict[str, Any],
+    refresh_item: Callable[[int], Awaitable[dict[str, Any] | None]],
+    *,
+    on_check: Callable[[int, dict[str, Any], int | None], Awaitable[None]] | None = None,
+) -> tuple[dict[str, Any], int | None]:
+    """
+    Wait until a robux listing appears (isForSale + price), similar to limited checks.
+    Limited flags often arrive before the item is actually put on sale.
+    """
+    item_id = int(item.get("id") or 0)
+    name = str(item.get("name") or item_id)
+    label = f"`{item_id}` {name}"
+
+    price = robux_list_price(item)
+    if price is not None:
+        return item, price
+
+    checks_max = price_check_max()
+    print(
+        f"[auto-snipe] waiting for robux price {label} · "
+        f"{PRICE_WATCH_SECONDS}s @ {PRICE_POLL_INTERVAL}s ({checks_max} checks)"
+    )
+
+    for attempt in range(1, checks_max + 1):
+        if attempt > 1:
+            await asyncio.sleep(PRICE_POLL_INTERVAL)
+        try:
+            fresh = await refresh_item(item_id)
+        except Exception as e:
+            print(f"[auto-snipe] price check {attempt}/{checks_max} failed {label}: {e}")
+            if on_check is not None:
+                try:
+                    await on_check(attempt, item, None)
+                except Exception:
+                    pass
+            continue
+        if fresh:
+            item = fresh
+
+        price = robux_list_price(item)
+        left = remaining_serials(item)
+        for_sale = item.get("isForSale")
+        raw_price = item.get("price")
+        print(
+            f"[auto-snipe] price check {attempt}/{checks_max} {label} · "
+            f"forSale={for_sale} price={raw_price} left={left}"
+        )
+        if on_check is not None:
+            try:
+                await on_check(attempt, item, price)
+            except Exception as e:
+                print(f"[auto-snipe] price check callback failed {label}: {e}")
+
+        # Stock gone while waiting for listing.
+        if left is not None and left <= 0:
+            print(f"[auto-snipe] sold out while waiting for price {label}")
+            return item, None
+        if price is not None:
+            print(f"[auto-snipe] robux price ready {label} · {price:,} R$")
+            return item, price
+
+    print(f"[auto-snipe] no robux price after {PRICE_WATCH_SECONDS}s {label}")
+    return item, None
+
+
 def can_auto_snipe(item: dict[str, Any], *, balance: int, allow_timed: bool = False) -> str | None:
     if not is_limited(item):
         return "not limited"
@@ -275,6 +349,7 @@ async def auto_snipe_limited(
     refresh_item,
     allow_timed: bool = False,
     skip_serial_delay: bool = False,
+    on_price_check: Callable[[int, dict[str, Any], int | None], Awaitable[None]] | None = None,
 ) -> dict[str, Any]:
     item_id = int(item.get("id") or 0)
     name = str(item.get("name") or item_id)
@@ -300,6 +375,16 @@ async def auto_snipe_limited(
 
     price = robux_list_price(item)
     if price is None:
+        item, price = await await_robux_list_price(
+            item,
+            refresh_item,
+            on_check=on_price_check,
+        )
+    if price is None:
+        left = remaining_serials(item)
+        if left is not None and left <= 0:
+            print(f"[auto-snipe] skip {label} · out of stock")
+            return {"ok": False, "reason": "out of stock", "item_id": item_id}
         print(f"[auto-snipe] skip {label} · no robux price")
         return {"ok": False, "reason": "no robux price", "item_id": item_id}
 
@@ -365,20 +450,36 @@ def _is_out_of_stock(item: dict[str, Any], err: str = "") -> bool:
     left = remaining_serials(item)
     if left is not None and left <= 0:
         return True
-    if item.get("isForSale") is False:
+    serials = _serial_count(item)
+    sales = _sale_count(item)
+    if serials > 0 and sales >= serials:
         return True
+    # isForSale=false / "not for sale" alone is NOT sold out — listing often lags.
+    if left is not None and left > 0:
+        return False
     low = (err or "").lower()
     needles = (
         "sold out",
         "out of stock",
-        "no longer for sale",
-        "not for sale",
         "insufficient quantity",
         "none left",
         "0 remaining",
         "already sold",
     )
     return any(n in low for n in needles)
+
+
+def _is_listing_not_ready(err: str) -> bool:
+    low = (err or "").lower()
+    return any(
+        n in low
+        for n in (
+            "not for sale",
+            "no longer for sale",
+            "price has changed",
+            "no robux",
+        )
+    )
 
 
 def _is_terminal_purchase_fail(err: str) -> bool:
@@ -421,25 +522,31 @@ async def _purchase_with_429_retry(
             if _is_terminal_purchase_fail(last_err):
                 print(f"[auto-snipe] failed {label}: {e}")
                 return {"ok": False, "reason": last_err, "item_id": item_id}
-            if not _is_429(last_err):
-                # Price changed / transient: refresh and keep trying a bit like 429.
-                if "price has changed" in last_err.lower() and refresh_item is not None:
-                    try:
-                        fresh = await refresh_item(item_id)
-                        if fresh:
-                            item = fresh
-                            new_price = robux_list_price(item)
-                            if new_price is not None:
-                                price = new_price
-                    except Exception:
-                        pass
-                elif "500" not in last_err and "InternalServerError" not in last_err:
+            if not _is_429(last_err) and not _is_listing_not_ready(last_err):
+                if "500" not in last_err and "InternalServerError" not in last_err:
                     print(f"[auto-snipe] failed {label}: {e}")
                     return {"ok": False, "reason": last_err, "item_id": item_id}
 
+            if refresh_item is not None and (
+                _is_listing_not_ready(last_err) or "price has changed" in last_err.lower()
+            ):
+                try:
+                    fresh = await refresh_item(item_id)
+                    if fresh:
+                        item = fresh
+                        new_price = robux_list_price(item)
+                        if new_price is not None:
+                            price = new_price
+                        if _is_out_of_stock(item):
+                            print(f"[auto-snipe] out of stock {label} · left={remaining_serials(item)}")
+                            return {"ok": False, "reason": "out of stock", "item_id": item_id}
+                except Exception:
+                    pass
+
             wait = min(1.0, 0.12 + 0.08 * min(attempt, 10))
+            kind = "429" if _is_429(last_err) else "listing"
             if attempt == 1 or attempt % 5 == 0:
-                print(f"[auto-snipe] 429 retry #{attempt} {label} · sleep {wait:.2f}s")
+                print(f"[auto-snipe] {kind} retry #{attempt} {label} · sleep {wait:.2f}s")
             await asyncio.sleep(wait)
 
             if refresh_item is not None and attempt % 3 == 0:
@@ -447,6 +554,9 @@ async def _purchase_with_429_retry(
                     fresh = await refresh_item(item_id)
                     if fresh:
                         item = fresh
+                        new_price = robux_list_price(item)
+                        if new_price is not None:
+                            price = new_price
                         if _is_out_of_stock(item):
                             print(f"[auto-snipe] out of stock {label} · left={remaining_serials(item)}")
                             return {"ok": False, "reason": "out of stock", "item_id": item_id}

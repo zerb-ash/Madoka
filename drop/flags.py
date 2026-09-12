@@ -13,6 +13,8 @@ from drop.parser import DropMessage
 from economy.snipe import (
     _serial_supply,
     auto_snipe_limited,
+    price_check_max,
+    remaining_serials,
 )
 
 OnNotify = Callable[[str], Awaitable[None]]
@@ -195,13 +197,26 @@ class DualFlagCoordinator:
             )
         )
 
-        # Instant channel buy — no SAFEBUY / human delay window.
+        async def _price_tick(attempt: int, fresh: dict[str, Any], price: int | None) -> None:
+            checks_max = price_check_max()
+            left = remaining_serials(fresh)
+            raw_price = fresh.get("price")
+            for_sale = fresh.get("isForSale")
+            price_text = f"{int(price):,} R$" if price is not None else "—"
+            await self.notify(
+                f"Price check **{attempt}/{checks_max}** · `{item_id}` **{name}** · "
+                f"forSale=`{for_sale}` · price=`{price_text}` · raw=`{raw_price}` · "
+                f"left=`{left if left is not None else '—'}`"
+            )
+
+        # Instant channel buy — no SAFEBUY / human delay. Poll for robux price if needed.
         result = await auto_snipe_limited(
             self.economy,
             item=item,
             refresh_item=self.refresh_item,
             allow_timed=True,
             skip_serial_delay=True,
+            on_price_check=_price_tick,
         )
 
         async with self._lock:
