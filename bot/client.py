@@ -33,6 +33,7 @@ from economy.snipe import (
     limited_kind_label,
     remaining_serials,
     watch_limited_then_snipe,
+    SAFEBUY_MIN_SALES,
 )
 from madxka.urls import catalog_item
 from madxka.http import MadxkaHttp
@@ -94,6 +95,7 @@ class MadokaBot(commands.Bot):
         self.tree.add_command(test_group)
         self.tree.add_command(ignore_group)
         self.tree.add_command(check_group)
+        self.tree.add_command(toggle_group)
 
     async def _sync_commands(self) -> None:
         self.tree.clear_commands(guild=None)
@@ -777,6 +779,30 @@ async def buy_free_cmd(interaction: discord.Interaction) -> None:
 
 
 redeem_group = app_commands.Group(name="redeem", description="Promocode tools")
+
+
+toggle_group = app_commands.Group(name="toggle", description="Toggle sniper options")
+
+
+@toggle_group.command(name="instantbuy", description="Toggle instant buy on channel drops")
+@app_commands.describe(enabled="true = buy immediately, false = wait for sales")
+async def toggle_instantbuy(interaction: discord.Interaction, enabled: bool) -> None:
+    bot = interaction.client
+    assert isinstance(bot, MadokaBot)
+
+    if not can_use_wallet(interaction, bot.settings):
+        await deny_wallet(interaction)
+        return
+
+    bot.dual_flags.instant_buy = bool(enabled)
+    state = "on" if enabled else "off"
+    mode = "instant buy" if enabled else f"wait until sales ≥{SAFEBUY_MIN_SALES} (skip serials #1-{SAFEBUY_MIN_SALES})"
+    print(f"[toggle] instantbuy={state}")
+    await interaction.response.send_message(
+        f"Instant buy **{state}** · channel snipes will {mode}.",
+        ephemeral=True,
+    )
+    await bot._watch_send(content=f"`[toggle]` instantbuy **{state}** · {mode}")
 
 
 @redeem_group.command(name="existing", description="Redeem all parsed codes from promo channels")

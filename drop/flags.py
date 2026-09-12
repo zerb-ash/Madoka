@@ -11,8 +11,13 @@ from catalog.item_kind import can_be_limited
 from catalog.restrictions import is_limited
 from drop.parser import DropMessage
 from economy.snipe import (
+    SAFEBUY_MIN_SALES,
+    SAFEBUY_POLL_INTERVAL,
+    _sale_count,
+    _serial_count,
     _serial_supply,
     auto_snipe_limited,
+    await_skip_early_serials,
     price_check_max,
     remaining_serials,
 )
@@ -54,6 +59,7 @@ class DualFlagCoordinator:
         self.delay_ms_min = max(0, int(delay_ms_min))
         self.delay_ms_max = max(self.delay_ms_min, int(delay_ms_max))
         self.safebuy = bool(safebuy)
+        self.instant_buy = False
         self.debug = debug
         self._flags: dict[int, FlagState] = {}
         self._lock = asyncio.Lock()
@@ -179,6 +185,10 @@ class DualFlagCoordinator:
         # Prefer cached item for speed; refresh only if we have nothing.
         if item is None:
             item = await self.refresh_item(item_id)
+        else:
+            fresh = await self.refresh_item(item_id)
+            if fresh:
+                item = fresh
 
         if item is None:
             async with self._lock:
@@ -188,28 +198,57 @@ class DualFlagCoordinator:
 
         supply = _serial_supply(item)
         name = str(item.get("name") or item_id)
-        self._log(f"both flags true `{item_id}` · supply={supply} · INSTANT buy · source={source}")
-        # Don't await Discord notify before the purchase POST.
-        asyncio.create_task(
-            self.notify(
-                f"Both flags true · `{item_id}` **{name}** · supply `{supply}` · "
-                f"**INSTANT buy** · source `{source}`"
-            )
+        sales = _sale_count(item)
+        serials = _serial_count(item)
+        left = remaining_serials(item)
+        instant = self.instant_buy
+        self._log(
+            f"both flags true `{item_id}` · sales={sales} serials={serials} "
+            f"left={left} supply={supply} · "
+            f"{'INSTANT buy' if instant else f'wait sales>={SAFEBUY_MIN_SALES}'} · "
+            f"source={source}"
         )
+
+        if instant:
+            asyncio.create_task(
+                self.notify(
+                    f"Both flags true · `{item_id}` **{name}** · supply `{supply}` · "
+                    f"**INSTANT buy** · source `{source}`"
+                )
+            )
+        else:
+            await self.notify(
+                f"Both flags true · `{item_id}` **{name}** · "
+                f"sales `{sales}` · serials `{serials}` · left `{left if left is not None else '—'}` · "
+                f"supply `{supply}` · waiting **sales ≥{SAFEBUY_MIN_SALES}** "
+                f"(skip serials #1-{SAFEBUY_MIN_SALES}) · poll `{SAFEBUY_POLL_INTERVAL}s` · source `{source}`"
+            )
+
+            async def _sales_tick(fresh: dict[str, Any], status: str) -> None:
+                await self.notify(f"`[safebuy]` `{item_id}` · {status}")
+
+            item, gate = await await_skip_early_serials(
+                item,
+                refresh_item=self.refresh_item,
+                on_tick=_sales_tick,
+            )
+            self._log(f"sales gate `{item_id}` · {gate}")
+            asyncio.create_task(
+                self.notify(f"`[safebuy]` `{item_id}` · buying · {gate}")
+            )
 
         async def _price_tick(attempt: int, fresh: dict[str, Any], price: int | None) -> None:
             checks_max = price_check_max()
-            left = remaining_serials(fresh)
+            tick_left = remaining_serials(fresh)
             raw_price = fresh.get("price")
             for_sale = fresh.get("isForSale")
             price_text = f"{int(price):,} R$" if price is not None else "—"
             await self.notify(
                 f"Price check **{attempt}/{checks_max}** · `{item_id}` **{name}** · "
                 f"forSale=`{for_sale}` · price=`{price_text}` · raw=`{raw_price}` · "
-                f"left=`{left if left is not None else '—'}`"
+                f"left=`{tick_left if tick_left is not None else '—'}`"
             )
 
-        # Instant channel buy — no SAFEBUY / human delay. Poll for robux price if needed.
         result = await auto_snipe_limited(
             self.economy,
             item=item,

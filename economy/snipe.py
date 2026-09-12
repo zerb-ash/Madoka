@@ -112,8 +112,8 @@ def channel_snipe_delay_seconds(item: dict[str, Any]) -> float:
     return random.uniform(2.0, 5.0)
 
 
-# Avoid serials 1-3: wait until saleCount >= 3 so next copy is #4+.
-SAFEBUY_MIN_SALES = 3
+# Skip serials #1-5: wait until saleCount >= 5 so next copy is #6+.
+SAFEBUY_MIN_SALES = 5
 SAFEBUY_POLL_INTERVAL = 0.25
 SAFEBUY_URGENT_LEFT = 5
 SAFEBUY_URGENT_RATIO = 0.85
@@ -204,6 +204,66 @@ async def await_channel_buy_window(
 
         sleep_for = min(SAFEBUY_POLL_INTERVAL, max(0.05, hard_deadline - now))
         await asyncio.sleep(sleep_for)
+        if item_id:
+            try:
+                fresh = await refresh_item(item_id)
+            except Exception as e:
+                print(f"[safebuy] refresh failed `{item_id}`: {e}")
+                fresh = None
+            if fresh:
+                item = fresh
+
+    sales = _sale_count(item)
+    left = remaining_serials(item)
+    print(
+        f"[safebuy] `{item_id}` buy gate · {reason} · "
+        f"sales={sales} serials={_serial_count(item)} left={left} "
+        f"elapsed={time.monotonic() - started:.2f}s"
+    )
+    return item, reason
+
+
+async def await_skip_early_serials(
+    item: dict[str, Any],
+    *,
+    refresh_item: Callable[[int], Awaitable[dict[str, Any] | None]],
+    on_tick: Callable[[dict[str, Any], str], Awaitable[None]] | None = None,
+    min_sales: int = SAFEBUY_MIN_SALES,
+) -> tuple[dict[str, Any], str]:
+    """Poll every 0.25s and buy only after enough sales to skip early serials."""
+    item_id = int(item.get("id") or 0)
+    started = time.monotonic()
+    min_sales = max(1, int(min_sales))
+
+    while True:
+        sales = _sale_count(item)
+        serials = _serial_count(item)
+        left = remaining_serials(item)
+        supply = _serial_supply(item)
+
+        if sales >= min_sales:
+            reason = f"sales={sales}>={min_sales} (skip #{1}-{min_sales})"
+            break
+        # Almost gone — buy even if still in the early serials.
+        if left is not None and left <= SAFEBUY_URGENT_LEFT:
+            reason = f"urgent left={left} sales={sales} (avoid miss)"
+            break
+        if supply > 0 and sales / supply >= SAFEBUY_URGENT_RATIO:
+            reason = f"urgent sales={sales}/{supply} left={left} (avoid miss)"
+            break
+
+        status = (
+            f"sales={sales}/{min_sales} · serials={serials} · "
+            f"left={left} · supply={supply}"
+        )
+        print(f"[safebuy] `{item_id}` wait · {status}")
+        if on_tick is not None:
+            try:
+                await on_tick(item, status)
+            except Exception:
+                pass
+
+        await asyncio.sleep(SAFEBUY_POLL_INTERVAL)
         if item_id:
             try:
                 fresh = await refresh_item(item_id)
