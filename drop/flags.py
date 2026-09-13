@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from catalog.filter import is_trap_item
+from catalog.filter import is_trap_item, trap_reason, trap_text
 from catalog.item_kind import can_be_limited
 from catalog.restrictions import is_limited
 from drop.parser import DropMessage
@@ -33,6 +33,7 @@ class FlagState:
     channel_ready: bool = False
     item: dict[str, Any] | None = None
     channel_message_id: int | None = None
+    channel_text: str = ""
     updated_at: float = field(default_factory=time.time)
     sniping: bool = False
     sniped: bool = False
@@ -64,6 +65,7 @@ class DualFlagCoordinator:
         self._flags: dict[int, FlagState] = {}
         self._lock = asyncio.Lock()
         self._safebuy_notified: set[int] = set()
+        self._trap_until = 0.0
 
     def _log(self, msg: str) -> None:
         print(f"[dual-flag] {msg}")
@@ -111,6 +113,19 @@ class DualFlagCoordinator:
         if both:
             await self._try_snipe(item_id, source="catalog+channel")
 
+    def note_channel_text(self, text: str) -> str | None:
+        reason = trap_text(text)
+        if not reason:
+            return None
+        self._trap_until = time.time() + self.flag_wait_seconds
+        self._log(f"channel trap · {reason}")
+        return reason
+
+    def _trap_hold(self) -> str | None:
+        if time.time() < self._trap_until:
+            return "channel dont-buy flag"
+        return None
+
     async def on_channel_drop(self, drop: DropMessage) -> None:
         if not drop.is_drop or not drop.item_ids:
             self._log(
@@ -127,6 +142,7 @@ class DualFlagCoordinator:
             state = self._get(item_id)
             state.channel_ready = True
             state.channel_message_id = drop.message_id
+            state.channel_text = drop.content or ""
             state.updated_at = time.time()
             catalog_ready = state.catalog_ready
             self._log(self.debug_flags(item_id))
@@ -194,6 +210,18 @@ class DualFlagCoordinator:
             async with self._lock:
                 self._get(item_id).sniping = False
             await self.notify(f"Snipe aborted `{item_id}` · details missing")
+            return
+
+        async with self._lock:
+            channel_text = self._get(item_id).channel_text
+        blocked = trap_reason(item) or trap_text(channel_text) or self._trap_hold()
+        if blocked:
+            async with self._lock:
+                state = self._get(item_id)
+                state.sniping = False
+                state.sniped = True
+            self._log(f"blocked `{item_id}` · {blocked}")
+            await self.notify(f"Snipe blocked `{item_id}` · dont-buy flag · `{blocked}`")
             return
 
         supply = _serial_supply(item)

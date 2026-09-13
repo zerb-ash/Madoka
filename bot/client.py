@@ -20,7 +20,7 @@ from bot.embeds import (
 from bot.inventory_views import InventoryTypeView
 from bot.poll_window import PollWindow
 from bot.views import InspectPickView, InspectView, send_inspect
-from catalog.filter import is_trap_item
+from catalog.filter import is_trap_item, trap_text
 from catalog.item_kind import can_be_limited
 from catalog.restrictions import is_limited
 from catalog.service import CatalogService
@@ -93,6 +93,7 @@ class MadokaBot(commands.Bot):
         self.tree.add_command(redeem_group)
         self.tree.add_command(catalog_group)
         self.tree.add_command(test_group)
+        self.tree.add_command(testfilter_cmd)
         self.tree.add_command(ignore_group)
         self.tree.add_command(check_group)
         self.tree.add_command(toggle_group)
@@ -306,6 +307,11 @@ class MadokaBot(commands.Bot):
             # Always mirror heard messages into watch channel so you can tell it's alive.
             preview = (message.content or "(empty)").replace("\n", " | ")[:140]
             kind = "DROP" if message.is_drop else "heard"
+            trap = self.dual_flags.note_channel_text(message.content or "")
+            if trap and not message.is_drop:
+                await self._watch_send(
+                    content=f"`[drop-debug]` dont-buy flag · `{trap}` · holding snipes"
+                )
             await self._watch_send(
                 content=(
                     f"`[drop-debug]` {kind} · ch=`{message.channel_id}` · "
@@ -902,6 +908,27 @@ async def test_random(interaction: discord.Interaction) -> None:
         return
 
     await send_inspect(interaction, bot, row)
+
+
+@app_commands.command(name="testfilter", description="Check if a name would be blocked as a dont-buy trap")
+@app_commands.describe(text="Name or phrase to test, e.g. D0NT BUY")
+async def testfilter_cmd(interaction: discord.Interaction, text: str) -> None:
+    raw = (text or "").strip()
+    if not raw:
+        await interaction.response.send_message("Give a word or phrase to test.", ephemeral=True)
+        return
+
+    reason = trap_text(raw)
+    if reason:
+        await interaction.response.send_message(
+            f"**blocked** · `{raw[:180]}`\nWould not buy · `{reason}`",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_message(
+        f"**passes** · `{raw[:180]}`\nNot flagged. This would still be buyable.",
+        ephemeral=True,
+    )
 
 
 ignore_group = app_commands.Group(name="ignore", description="Ignore catalog items by name keyword")
