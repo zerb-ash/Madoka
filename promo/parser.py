@@ -5,36 +5,11 @@ from dataclasses import dataclass
 
 ROLE_MENTION_RE = re.compile(r"<@&(\d+)>")
 PROMO_LABEL_RE = re.compile(r"promocode\s*:\s*([A-Za-z0-9]+)", re.I)
-ALLCAPS_TOKEN_RE = re.compile(r"\b([A-Z0-9]{6,})\b")
-# After a code ping, also accept long mixed alnum tokens (e.g. VoteForVancy2026).
-MIXED_TOKEN_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{5,})\b")
+ALLCAPS_TOKEN_RE = re.compile(r"\b([A-Z0-9]{2,})\b")
+# After a code ping, also accept mixed alnum tokens (e.g. VoteForVancy2026).
+MIXED_TOKEN_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{2,})\b")
 
-NOISE = frozenset(
-    {
-        "EXPIRED",
-        "SORRY",
-        "WORKING",
-        "AMERICA",
-        "LIMITED",
-        "ROBUX",
-        "COPIES",
-        "EXPIRES",
-        "EVERYBODY",
-        "EVERYONE",
-        "PROMOCODE",
-        "PROMOCODES",
-        "CODEPINGS",
-        "FEEDING",
-        "MOBILE",
-        "MAXEDOUT",
-        "NICE",
-        "DUDE",
-        "BRIBING",
-        "PEOPLE",
-        "COOKED",
-        "CHAPTER",
-    }
-)
+MIXED_TOKEN_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9]{2,})\b")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,13 +67,10 @@ def extract_promo_codes(content: str, *, allow_mixed: bool = False) -> list[str]
 
 
 def _ok(code: str) -> bool:
-    if len(code) < 6:
-        return False
-    if code in NOISE:
+    if len(code) < 2:
         return False
     if code.isdigit():
         return False
-    # Require at least one letter.
     if not any(ch.isalpha() for ch in code):
         return False
     return True

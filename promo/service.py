@@ -74,17 +74,10 @@ class PromoSnipeService:
             f"codes={list(hit.codes) or '—'} · {preview}"
         )
 
-        # Official channel: if role id is set, only act on pinged drops
-        # (or explicit `promocode:` labels). Test channel never requires ping.
-        role_required = self.settings.role_id is not None and not is_test
-        labeled = "promocode:" in content.lower()
-        if role_required and not hit.has_ping and not labeled:
-            self._log(f"skip msg={message_id} · waiting for promo role ping")
-            return
-
+        # Silent drops count. Any ALL CAPS word is redeemed even with no role ping.
+        # Extra words are fine — invalid ones just fail the redeem.
         codes = list(hit.codes)
 
-        # Codes in-message → redeem instantly (don't wait on Discord notify / neighbors).
         if codes:
             self._log(f"snipe now · {codes}")
             asyncio.create_task(
@@ -97,14 +90,14 @@ class PromoSnipeService:
             )
             return
 
-        # Ping present but no code in-body → check 2 messages above/below.
-        if hit.has_ping and self.fetch_around is not None and message_id:
+        # Ping (or no code in a short message) → check 2 messages above/below.
+        if self.fetch_around is not None and message_id and (hit.has_ping or not codes):
             try:
                 nearby = await self.fetch_around(channel_id, message_id)
             except Exception as e:
                 self._log(f"nearby fetch failed: {e}")
                 nearby = []
-            codes = self._codes_from_neighbors(nearby, message_id, allow_mixed=True)
+            codes = self._codes_from_neighbors(nearby, message_id, allow_mixed=hit.has_ping)
             if codes:
                 self._log(f"snipe nearby · {codes}")
                 asyncio.create_task(
@@ -116,10 +109,6 @@ class PromoSnipeService:
                     name=f"promo-snipe-near-{message_id}",
                 )
                 return
-            self._log(
-                f"ping without code · ch={channel_id} msg={message_id} · {preview}"
-            )
-            return
 
         self._log(f"no code in msg={message_id}")
 
@@ -209,7 +198,7 @@ class PromoSnipeService:
             rows = await self.fetch_recent(channel_id, limit)
             scanned += len(rows)
             for row in rows:
-                collected.extend(extract_promo_codes(_msg_content(row), allow_mixed=True))
+                collected.extend(extract_promo_codes(_msg_content(row)))
 
         codes = list(dict.fromkeys(collected))
         self._log(f"existing · scanned {scanned} msg(s) · {len(codes)} code(s)")
