@@ -29,3 +29,23 @@ class DropMonitorSettings:
         if self.test_channel_id:
             out.add(self.test_channel_id)
         return out
+
+    def guild_channel_map(
+        self,
+        *,
+        promo_channel_id: int | None = None,
+        promo_test_channel_id: int | None = None,
+    ) -> dict[int, set[int]]:
+        # Discord user gateway needs OP 14 per guild or large servers stay silent.
+        out: dict[int, set[int]] = {}
+
+        def add(guild_id: int | None, channel_id: int | None) -> None:
+            if not guild_id or not channel_id:
+                return
+            out.setdefault(int(guild_id), set()).add(int(channel_id))
+
+        add(self.guild_id, self.channel_id)
+        add(self.test_guild_id, self.test_channel_id)
+        add(self.guild_id, promo_channel_id)
+        add(self.test_guild_id, promo_test_channel_id)
+        return out

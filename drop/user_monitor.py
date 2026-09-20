@@ -26,6 +26,7 @@ class DropUserMonitor:
         *,
         channel_ids: set[int],
         test_channel_ids: set[int] | None = None,
+        guild_channels: dict[int, set[int]] | None = None,
         role_id: int | None = None,
         on_drop: OnDrop | None = None,
         on_raw: OnRaw | None = None,
@@ -34,6 +35,11 @@ class DropUserMonitor:
         self.token = (token or "").strip()
         self.channel_ids = set(channel_ids)
         self.test_channel_ids = set(test_channel_ids or ())
+        self.guild_channels = {
+            int(gid): {int(cid) for cid in cids}
+            for gid, cids in (guild_channels or {}).items()
+            if gid and cids
+        }
         self.role_id = role_id
         self.on_drop = on_drop
         self.on_raw = on_raw
@@ -187,6 +193,11 @@ class DropUserMonitor:
                         self._user = (d or {}).get("user") if isinstance(d, dict) else None
                         uname = (self._user or {}).get("username")
                         print(f"[drop-monitor] ready as {uname} · watching {sorted(self.channel_ids)}")
+                        await self._subscribe_all(ws)
+                    elif op == 0 and event == "GUILD_CREATE":
+                        guild_id = int((d or {}).get("id") or 0) if isinstance(d, dict) else 0
+                        if guild_id in self.guild_channels:
+                            await self._subscribe_guild(ws, guild_id)
                     elif op == 0 and event == "MESSAGE_CREATE":
                         await self._on_message(d if isinstance(d, dict) else {})
                     elif op == 7:  # reconnect
@@ -236,6 +247,33 @@ class DropUserMonitor:
                 },
             },
         }
+
+    async def _subscribe_all(self, ws: aiohttp.ClientWebSocketResponse) -> None:
+        if not self.guild_channels:
+            print("[drop-monitor] no guild_channels map · large servers may stay silent")
+            return
+        for guild_id in sorted(self.guild_channels):
+            await self._subscribe_guild(ws, guild_id)
+
+    async def _subscribe_guild(self, ws: aiohttp.ClientWebSocketResponse, guild_id: int) -> None:
+        channels = self.guild_channels.get(int(guild_id)) or set()
+        if not channels:
+            return
+        payload = {
+            "op": 14,
+            "d": {
+                "guild_id": str(guild_id),
+                "typing": True,
+                "activities": True,
+                "threads": True,
+                "channels": {str(cid): [[0, 99]] for cid in sorted(channels)},
+            },
+        }
+        await ws.send_json(payload)
+        print(
+            f"[drop-monitor] subscribed guild={guild_id} "
+            f"channels={sorted(channels)}"
+        )
 
     async def _heartbeat(self, ws: aiohttp.ClientWebSocketResponse) -> None:
         try:

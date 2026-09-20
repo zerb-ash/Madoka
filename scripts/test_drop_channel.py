@@ -93,18 +93,28 @@ async def main() -> None:
 
     monitor = None
     last_err = None
+    promo = settings.promo
     test_ids = {drop.test_channel_id} if drop.test_channel_id else set()
+    if promo.test_channel_id:
+        test_ids.add(promo.test_channel_id)
+    channels = channels | promo.watched_channel_ids()
+    guild_channels = drop.guild_channel_map(
+        promo_channel_id=promo.channel_id,
+        promo_test_channel_id=promo.test_channel_id,
+    )
     for i, token in enumerate(tokens, start=1):
         candidate = DropUserMonitor(
             token,
             channel_ids=channels,
             test_channel_ids=test_ids,
+            guild_channels=guild_channels,
             role_id=drop.role_id,
             debug=True,
         )
         try:
             me = await candidate.probe_auth()
             print(f"auth ok token#{i} · {me.get('username')} ({me.get('id')})")
+            print(f"guild subscriptions: { {g: sorted(c) for g, c in guild_channels.items()} }")
             monitor = candidate
             break
         except Exception as e:

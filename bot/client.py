@@ -326,11 +326,16 @@ class MadokaBot(commands.Bot):
             test_ids = {drop.test_channel_id} if drop.test_channel_id else set()
             if promo.test_channel_id:
                 test_ids.add(promo.test_channel_id)
+            guild_channels = drop.guild_channel_map(
+                promo_channel_id=promo.channel_id,
+                promo_test_channel_id=promo.test_channel_id,
+            )
             for i, token in enumerate(tokens, start=1):
                 monitor = DropUserMonitor(
                     token,
                     channel_ids=channels,
                     test_channel_ids=test_ids,
+                    guild_channels=guild_channels,
                     role_id=drop.role_id,
                     on_drop=on_drop,
                     on_raw=on_raw,
@@ -346,6 +351,7 @@ class MadokaBot(commands.Bot):
                     monitor.start()
                     print(
                         f"[drop-monitor] started · channels {sorted(channels)} · "
+                        f"guilds={ {g: sorted(c) for g, c in guild_channels.items()} } · "
                         f"test={sorted(test_ids)} · promo={sorted(promo_channels)} · "
                         f"promo_role={promo.role_id or 'unset'}"
                     )
@@ -354,6 +360,7 @@ class MadokaBot(commands.Bot):
                         content=(
                             f"`[drop-debug]` monitor online as **{me.get('username')}** · "
                             f"watching `{', '.join(str(c) for c in sorted(channels))}` · "
+                            f"guilds `{', '.join(str(g) for g in sorted(guild_channels)) or '—'}` · "
                             f"promo channels `{', '.join(str(c) for c in sorted(promo_channels)) or '—'}` · "
                             f"promo role `{promo.role_id or 'unset'}`"
                         )
