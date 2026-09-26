@@ -26,7 +26,8 @@ _TRAP_PHRASES: tuple[str, ...] = (
 )
 
 _BLOCK_PATTERNS: tuple[Pattern[str], ...] = (
-    re.compile(r"ban", re.I),
+    # Word-boundary ban — bare "ban" matched Bandana / Banana / Banded / Urban.
+    re.compile(r"\bban(?:ned)?\b", re.I),
     re.compile(r"do\s*not\s*buy", re.I),
     re.compile(r"don'?t\s*buy", re.I),
     re.compile(r"no\s*buy", re.I),
@@ -50,14 +51,16 @@ _FUZZY_PAIRS: tuple[tuple[str, str], ...] = (
     ("dont", "buy"),
     ("donot", "buy"),
     ("dont", "purchase"),
+    ("no", "buy"),
     ("buy", "ban"),
 )
+# Long smashed forms only. Short "nobuy" is covered by the "no buy" phrase/regex —
+# fuzzy-matching it caused false hits on "and you" / "you find".
 _FUZZY_BLOBS: tuple[str, ...] = (
     "dontbuy",
     "donotbuy",
     "dontpurchase",
     "buyban",
-    "nobuy",
 )
 _LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s"})
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
@@ -70,7 +73,8 @@ def _item_text(item: dict[str, Any]) -> str:
 
 
 def _norm(text: str) -> str:
-    return (text or "").lower().translate(_LEET)
+    # Drop apostrophes so DN'T / DON'T tokenize as dnt / dont.
+    return (text or "").lower().translate(_LEET).replace("'", "").replace("'", "")
 
 
 def _covers(token: str, target: str, *, max_extra: int, max_miss: int = 0) -> bool:
@@ -91,8 +95,14 @@ def _fuzzy_trap(text: str) -> str | None:
         return None
 
     def hit_word(token: str, target: str) -> bool:
-        extra = 2 if len(target) >= 4 else 1
+        # "no" may gain one junk letter (NOO); "buy" stays exact to avoid FPs.
+        if target == "no":
+            return _covers(token, target, max_extra=1, max_miss=0)
+        if len(target) <= 2:
+            return token == target
+        # Allow 1 missing letter on longer stems (DNT≈DONT) and 1 junk letter (DOPNT).
         miss = 1 if len(target) >= 4 else 0
+        extra = 1
         if _covers(token, target, max_extra=extra, max_miss=miss):
             return True
         # One token can be two smashed words: DOPNTBUIY
@@ -105,26 +115,30 @@ def _fuzzy_trap(text: str) -> str | None:
                         return True
         return False
 
-    for i, token in enumerate(tokens):
-        window = tokens[i : i + 3]
+    for i, _token in enumerate(tokens):
         for left, right in _FUZZY_PAIRS:
+            # Short stems (no+buy) must be adjacent — avoids "no way buy" FPs.
+            span = 2 if min(len(left), len(right)) <= 2 else 3
+            window = tokens[i : i + span]
+            if len(window) < 2:
+                continue
             has_left = any(hit_word(tok, left) for tok in window)
             has_right = any(hit_word(tok, right) for tok in window)
             if has_left and has_right:
                 return f"scrambled {left} {right}"
 
-    chunks: list[str] = list(tokens)
-    chunks.extend(a + b for a, b in zip(tokens, tokens[1:]))
+    # Whole-token / smashed-token blobs only — do NOT glue "and"+"you".
     for blob in _FUZZY_BLOBS:
         extra = 2
-        width_max = len(blob) + extra
-        for chunk in chunks:
-            if len(chunk) < len(blob):
-                continue
-            for i in range(0, len(chunk) - len(blob) + 1):
-                for width in range(len(blob), min(width_max, len(chunk) - i) + 1):
-                    if _covers(chunk[i : i + width], blob, max_extra=extra, max_miss=1):
-                        return f"scrambled {blob}"
+        for token in tokens:
+            if _covers(token, blob, max_extra=extra, max_miss=0):
+                return f"scrambled {blob}"
+            if len(token) >= len(blob):
+                width_max = len(blob) + extra
+                for i in range(0, len(token) - len(blob) + 1):
+                    for width in range(len(blob), min(width_max, len(token) - i) + 1):
+                        if _covers(token[i : i + width], blob, max_extra=extra, max_miss=0):
+                            return f"scrambled {blob}"
     return None
 
 
